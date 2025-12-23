@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Sube el video a YouTube con compatibilidad para Python 3.9, imprime el canal
+autenticado, la privacidad efectiva y verifica el video subido (status/canal).
+Requiere credentials.json y generará token.json.
+
+✅ Render (headless): NO puede abrir navegador.
+   Debes setear en Render:
+   - YT_CREDENTIALS_JSON_B64
+   - YT_TOKEN_JSON_B64
+
+✅ Nuevo (mínimo): si existe out/finanzas_hoy_short.mp4 lo sube también,
+pero SOLO si su duración <= 180s (3 min). No se trunca.
+"""
+
+import base64
+import datetime as dt
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+# --- Compatibilidad Python 3.9: evita AttributeError de importlib.metadata ---
+try:
+    import importlib.metadata as _im  # stdlib
+    _ = _im.packages_distributions  # puede no existir en 3.9
+except Exception:
+    try:
+        import importlib.metadata as _im
+
+        import importlib_metadata as _imb  # backport
+        _im.packages_distributions = _imb.packages_distributions  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            import importlib.metadata as _im
+            _im.packages_distributions = lambda: {}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
+
+# ===== Config =====
+BASE = Path(__file__).resolve().parent
+CREDENTIALS_FILE = BASE / "credentials.json"
+TOKEN_FILE = BASE / "token.json"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube",
+]
+
+SHORTS_MAX_SECONDS = float(os.getenv("YT_SHORTS_MAX_SECONDS", "180"))  # 3 min
+
+
+def _env_b64_present(name: str) -> bool:
+    v = os.getenv(name, "")
+    return bool(v and v.strip())
+
+
+def _write_env_b64(name: str, path: Path):
+    raw = base64.b64decode(os.getenv(name, "").encode("utf-8"))
+    path.write_bytes(raw)
+
+
+def get_service():
+    """
+    ✅ Local: usa credentials.json + token.json en el repo (y si falta token, abre navegador).
+    ✅ Render (headless): usa variables de entorno Base64:
+       - YT_CREDENTIALS_JSON_B64
+       - YT_TOKEN_JSON_B64
+       (NO intenta abrir navegador)
+    """
+    creds = None
+
+    credentials_file = CREDENTIALS_FILE
+    token_file = TOKEN_FILE
+
+    using_env = _env_b64_present("YT_CREDENTIALS_JSON_B64") and _env_b64_present("YT_TOKEN_JSON_B64")
+    if using_env:
+        runtime = BASE / ".runtime"
+        runtime.mkdir(exist_ok=True)
+        credentials_file = runtime / "credentials.json"
+        token_file = runtime / "token.json"
+        _write_env_b64("YT_CREDENTIALS_JSON_B64", credentials_file)
+        _write_env_b64("YT_TOKEN_JSON_B64", token_file)
+
+    # 1) Cargar token si existe
+    if token_file.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+        except Exception as e:
+            print(f"⚠️ No se pudo leer token.json ({e}), pidiendo login nuevo...")
+            creds = None
+
+    headless = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID")) or (os.getenv("HEADLESS") == "1") or (not sys.stdin.isatty())
+
+    # 2) Refrescar o re-autenticar
+    if not creds or not creds.valid:
+        try:
+            if creds and creds.expired and creds.refresh_token:
+                print("🔄 Intentando refrescar token de YouTube...")
+                creds.refresh(Request())
+            else:
+                raise RefreshError("No hay refresh_token, hay que reautenticar.")
+        except RefreshError as e:
+            if using_env or headless:
+                raise RuntimeError(
+                    "Token inválido/expirado y estoy en modo headless (Render). "
+                    "Solución: genera token.json LOCAL (con navegador), "
+                    "convierte token.json y credentials.json a Base64 y súbelos como "
+                    "YT_TOKEN_JSON_B64 / YT_CREDENTIALS_JSON_B64 en Render."
+                ) from e
+
+            print(f"⚠️ Token inválido/expirado ({e}). Eliminando token.json y pidiendo login de nuevo...")
+            try:
+                if token_file.exists():
+                    token_file.unlink()
+            except Exception as rm_err:
+                print(f"⚠️ No se pudo borrar token.json: {rm_err}")
+
+            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        token_file.write_text(creds.to_json(), encoding="utf-8")
+
+    return build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+
+def whoami(youtube):
+    """Devuelve (channel_id, channel_title) de la cuenta autenticada."""
+    me = youtube.channels().list(part="id,snippet", mine=True).execute()
+    items = me.get("items") or []
+    if not items:
+        return None, None
+    ch = items[0]
+    return ch.get("id"), ch.get("snippet", {}).get("title")
+
+
+def upload_video(
+    youtube,
+    video_path: Path,
+    title: str,
+    description: str,
+    privacy: str = "public",
+) -> Optional[str]:
+    body = {
+        "snippet": {"title": title, "description": description, "categoryId": "22"},
+        "status": {"privacyStatus": privacy},
+    }
+
+    media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)
+
+    req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+    response = None
+    while response is None:
+        status, response = req.next_chunk()
+        if status:
+            print(f"⏫ Upload {int(status.progress() * 100)}%")
+
+    return response.get("id")
+
+
+def _ffprobe_duration_seconds(path: Path) -> Optional[float]:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if not out:
+            return None
+        return float(out)
+    except Exception:
+        return None
+
+
+def main():
+    youtube = get_service()
+    ch_id, ch_title = whoami(youtube)
+    print(f"👤 Canal autenticado: {ch_title} ({ch_id})")
+
+    video = BASE / "out" / "finanzas_hoy.mp4"
+    if not video.exists():
+        print(f"❌ No existe el video: {video}")
+        sys.exit(1)
+
+    # opcional: short generado por make_video.sh
+    short_video = BASE / "out" / "finanzas_hoy_short.mp4"
+
+    date_str = dt.datetime.now().strftime("%Y-%m-%d")
+    title_tpl = os.getenv("YT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date}")
+    title = title_tpl.format(date=date_str)
+    description = os.getenv("YT_DESCRIPTION", "Resumen diario de indicadores y mercados.")
+    privacy = os.getenv("YT_PRIVACY", "public")
+
+    try:
+        # 1) Video normal (igual que siempre)
+        vid = upload_video(youtube, video, title=title, description=description, privacy=privacy)
+        print(f"✅ Video subido. ID: {vid} | privacidad: {privacy}")
+
+        # 2) Short (solo si existe y cumple <= 3 min, SIN truncar)
+        if short_video.exists():
+            dur = _ffprobe_duration_seconds(short_video)
+            if dur is None:
+                print("⚠️ No pude leer duración del short con ffprobe. No lo subo por seguridad.")
+            elif dur > SHORTS_MAX_SECONDS:
+                print(f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s. (No truncamos)")
+            else:
+                # por defecto usa mismo title/desc/privacy, solo agrega #Shorts si no está
+                desc_short = description
+                if "#shorts" not in (desc_short or "").lower():
+                    desc_short = (desc_short or "").rstrip() + "\n\n#Shorts"
+
+                vid_s = upload_video(youtube, short_video, title=title, description=desc_short, privacy=privacy)
+                print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
+
+    except HttpError as e:
+        print(f"❌ Error YouTube API: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()

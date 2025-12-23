@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Env / venv
+.venv/
+venv/
+
+# Runtime
+.runtime/
+*.log
+logs/
+log.txt
+
+# Outputs
+out/
+data/latest.json
+
+# Secrets (NO commitear)
+credentials.json
+token.json

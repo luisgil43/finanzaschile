@@ -1,0 +1,10 @@
+.venv
+venv
+__pycache__
+out
+logs
+.runtime
+credentials.json
+token.json
+__MACOSX
+.DS_Store
