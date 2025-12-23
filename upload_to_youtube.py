@@ -159,9 +159,11 @@ def main():
     video = BASE / "out" / "finanzas_hoy.mp4"
     short_video = BASE / "out" / "finanzas_hoy_short.mp4"
 
-    date_str = dt.datetime.now().strftime("%Y-%m-%d")
+    # ✅ FIX: DD-MM-YYYY
+    date_str = dt.datetime.now().strftime("%d-%m-%Y")
+
     title = os.getenv("YT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date}").format(date=date_str)
-    description = os.getenv("YT_DESCRIPTION", "Resumen diario de indicadores y mercados.")
+    description = os.getenv("YT_DESCRIPTION")
     privacy = os.getenv("YT_PRIVACY", "public")
     short_title = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date} #Shorts").format(date=date_str)
 
