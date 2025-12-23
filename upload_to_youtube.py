@@ -12,8 +12,7 @@ Requiere credentials.json y generará token.json.
    - YT_TOKEN_JSON_B64
 
 ✅ Nuevo (mínimo): si existe out/finanzas_hoy_short.mp4 lo sube también,
-PERO ahora exige <= 60s (Short real). Si excede, NO lo sube.
-(El truncado/cap se hace en make_video.sh).
+PERO exige <= 60s para que sea Short real (cap/trunc se hace en make_video.sh).
 """
 
 import base64
@@ -59,8 +58,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube",
 ]
 
-# ✅ Para Short “real”, lo más seguro es <= 60s.
-# En make_video.sh lo ideal es cap a 59.0 para ir seguro.
 SHORTS_MAX_SECONDS = float(os.getenv("YT_SHORTS_MAX_SECONDS", "60"))
 
 
@@ -75,13 +72,6 @@ def _write_env_b64(name: str, path: Path):
 
 
 def get_service():
-    """
-    ✅ Local: usa credentials.json + token.json en el repo (y si falta token, abre navegador).
-    ✅ Render (headless): usa variables de entorno Base64:
-       - YT_CREDENTIALS_JSON_B64
-       - YT_TOKEN_JSON_B64
-       (NO intenta abrir navegador)
-    """
     creds = None
 
     credentials_file = CREDENTIALS_FILE
@@ -96,7 +86,6 @@ def get_service():
         _write_env_b64("YT_CREDENTIALS_JSON_B64", credentials_file)
         _write_env_b64("YT_TOKEN_JSON_B64", token_file)
 
-    # 1) Cargar token si existe
     if token_file.exists():
         try:
             creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
@@ -106,7 +95,6 @@ def get_service():
 
     headless = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID")) or (os.getenv("HEADLESS") == "1") or (not sys.stdin.isatty())
 
-    # 2) Refrescar o re-autenticar
     if not creds or not creds.valid:
         try:
             if creds and creds.expired and creds.refresh_token:
@@ -139,7 +127,6 @@ def get_service():
 
 
 def whoami(youtube):
-    """Devuelve (channel_id, channel_title) de la cuenta autenticada."""
     me = youtube.channels().list(part="id,snippet", mine=True).execute()
     items = me.get("items") or []
     if not items:
@@ -197,7 +184,6 @@ def main():
         print(f"❌ No existe el video: {video}")
         sys.exit(1)
 
-    # opcional: short generado por make_video.sh
     short_video = BASE / "out" / "finanzas_hoy_short.mp4"
 
     date_str = dt.datetime.now().strftime("%Y-%m-%d")
@@ -206,16 +192,18 @@ def main():
     description = os.getenv("YT_DESCRIPTION", "Resumen diario de indicadores y mercados.")
     privacy = os.getenv("YT_PRIVACY", "public")
 
-    # Plantillas para short (mínimo, pero útil)
     short_title_tpl = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date} #Shorts")
     short_title = short_title_tpl.format(date=date_str)
 
     try:
-        # 1) Video normal (igual que siempre)
+        # 1) Video normal
         vid = upload_video(youtube, video, title=title, description=description, privacy=privacy)
         print(f"✅ Video subido. ID: {vid} | privacidad: {privacy}")
+        if vid:
+            # línea parseable para el server
+            print(f"UPLOAD_RESULT kind=normal id={vid} privacy={privacy}")
 
-        # 2) Short (solo si existe y cumple <= 60s)
+        # 2) Short
         if short_video.exists():
             dur = _ffprobe_duration_seconds(short_video)
             if dur is None:
@@ -226,13 +214,14 @@ def main():
                     f"Solución: cap/trunc en make_video.sh (recomendado 59s)."
                 )
             else:
-                # Desc: misma base + #Shorts
                 desc_short = description or ""
                 if "#shorts" not in desc_short.lower():
                     desc_short = desc_short.rstrip() + "\n\n#Shorts"
 
                 vid_s = upload_video(youtube, short_video, title=short_title, description=desc_short, privacy=privacy)
                 print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
+                if vid_s:
+                    print(f"UPLOAD_RESULT kind=short id={vid_s} privacy={privacy}")
         else:
             print("ℹ️ No existe out/finanzas_hoy_short.mp4, no se sube short.")
 
