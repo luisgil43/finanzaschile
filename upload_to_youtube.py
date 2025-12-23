@@ -12,7 +12,8 @@ Requiere credentials.json y generará token.json.
    - YT_TOKEN_JSON_B64
 
 ✅ Nuevo (mínimo): si existe out/finanzas_hoy_short.mp4 lo sube también,
-pero SOLO si su duración <= 180s (3 min). No se trunca.
+PERO ahora exige <= 60s (Short real). Si excede, NO lo sube.
+(El truncado/cap se hace en make_video.sh).
 """
 
 import base64
@@ -58,7 +59,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube",
 ]
 
-SHORTS_MAX_SECONDS = float(os.getenv("YT_SHORTS_MAX_SECONDS", "180"))  # 3 min
+# ✅ Para Short “real”, lo más seguro es <= 60s.
+# En make_video.sh lo ideal es cap a 59.0 para ir seguro.
+SHORTS_MAX_SECONDS = float(os.getenv("YT_SHORTS_MAX_SECONDS", "60"))
 
 
 def _env_b64_present(name: str) -> bool:
@@ -158,7 +161,6 @@ def upload_video(
     }
 
     media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)
-
     req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
@@ -204,26 +206,35 @@ def main():
     description = os.getenv("YT_DESCRIPTION", "Resumen diario de indicadores y mercados.")
     privacy = os.getenv("YT_PRIVACY", "public")
 
+    # Plantillas para short (mínimo, pero útil)
+    short_title_tpl = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date} #Shorts")
+    short_title = short_title_tpl.format(date=date_str)
+
     try:
         # 1) Video normal (igual que siempre)
         vid = upload_video(youtube, video, title=title, description=description, privacy=privacy)
         print(f"✅ Video subido. ID: {vid} | privacidad: {privacy}")
 
-        # 2) Short (solo si existe y cumple <= 3 min, SIN truncar)
+        # 2) Short (solo si existe y cumple <= 60s)
         if short_video.exists():
             dur = _ffprobe_duration_seconds(short_video)
             if dur is None:
                 print("⚠️ No pude leer duración del short con ffprobe. No lo subo por seguridad.")
             elif dur > SHORTS_MAX_SECONDS:
-                print(f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s. (No truncamos)")
+                print(
+                    f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s. "
+                    f"Solución: cap/trunc en make_video.sh (recomendado 59s)."
+                )
             else:
-                # por defecto usa mismo title/desc/privacy, solo agrega #Shorts si no está
-                desc_short = description
-                if "#shorts" not in (desc_short or "").lower():
-                    desc_short = (desc_short or "").rstrip() + "\n\n#Shorts"
+                # Desc: misma base + #Shorts
+                desc_short = description or ""
+                if "#shorts" not in desc_short.lower():
+                    desc_short = desc_short.rstrip() + "\n\n#Shorts"
 
-                vid_s = upload_video(youtube, short_video, title=title, description=desc_short, privacy=privacy)
+                vid_s = upload_video(youtube, short_video, title=short_title, description=desc_short, privacy=privacy)
                 print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
+        else:
+            print("ℹ️ No existe out/finanzas_hoy_short.mp4, no se sube short.")
 
     except HttpError as e:
         print(f"❌ Error YouTube API: {e}")

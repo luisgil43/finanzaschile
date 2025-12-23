@@ -10,42 +10,29 @@ from typing import Dict, Tuple
 
 from flask import Flask, jsonify, request
 
-# =========================
-# Flask app
-# =========================
 app = Flask(__name__)
 
 RUN_TOKEN = os.getenv("RUN_TOKEN", "").strip()
 
-# Zona horaria (de Render) - ya la tienes en env TZ=America/Santiago
 TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
-
-# Ventana de ejecución a las 7am: permite que Better Stack pegue 1-5-10 min y no falle por segundos
-# Por defecto: 10 minutos (07:00:00 hasta 07:09:59)
 RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
 RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
-
-# Permite forzar ejecución manual aunque no sea hora (solo con token + force=1)
 ALLOW_FORCE = os.getenv("ALLOW_FORCE", "1") == "1"
 
-# Estado persistido (best-effort) en el filesystem del contenedor
-# (en Render free el FS es efímero si reinician el contenedor, pero dentro del día normalmente basta)
 RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", "/tmp/finanzaschile"))
 STATE_FILE = RUNTIME_DIR / "state.json"
 LOCK_FILE = RUNTIME_DIR / "run.lock"
 LOG_FILE = RUNTIME_DIR / "last_run.log"
 
-# Evita doble start dentro del mismo proceso
 _thread_guard = threading.Lock()
 _background_thread = None
 
 
 def _tz_now() -> dt.datetime:
     try:
-        from zoneinfo import ZoneInfo  # py3.9+
+        from zoneinfo import ZoneInfo
         return dt.datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
-        # fallback: naive localtime (no ideal, pero no rompe)
         return dt.datetime.now()
 
 
@@ -77,9 +64,6 @@ def _run(cmd) -> Tuple[int, str, str]:
 
 
 def _acquire_lock_nonblocking():
-    """
-    Lock de proceso/worker (fcntl). Si ya hay uno corriendo, no ejecuta.
-    """
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     fp = LOCK_FILE.open("w")
     try:
@@ -91,28 +75,21 @@ def _acquire_lock_nonblocking():
 
 
 def _within_run_window(now: dt.datetime) -> bool:
-    # Lunes=0 ... Domingo=6
     is_weekday = now.weekday() <= 4
     if not is_weekday:
         return False
     if now.hour != RUN_HOUR:
         return False
-    # Ventana: 07:00..07:(window-1)
     return 0 <= now.minute < max(1, RUN_WINDOW_MINUTES)
 
 
-def _should_run(now: dt.datetime, state: Dict) -> Tuple[bool, str]:
-    """
-    Decide si corresponde correr HOY.
-    """
+def _should_run(now: dt.datetime, state: Dict):
     if not _within_run_window(now):
         return False, "outside_schedule"
-
     today = now.date().isoformat()
     last_ok = (state.get("last_success_date") or "").strip()
     if last_ok == today:
         return False, "already_ran_today"
-
     return True, "ok_to_run"
 
 
@@ -127,9 +104,6 @@ def _pipeline_steps():
 
 
 def _run_pipeline_job(started_by: str, forced: bool):
-    """
-    Corre el pipeline en background. Actualiza state + log.
-    """
     now = _tz_now()
     state = _read_state()
 
@@ -145,7 +119,6 @@ def _run_pipeline_job(started_by: str, forced: bool):
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
         _append_log("LOCK: already running, exiting.")
-        # Marca como "skipped" (no es error)
         st = _read_state()
         st["last_status"] = "skipped_already_running"
         st["last_finished_at"] = _tz_now().isoformat(timespec="seconds")
@@ -203,9 +176,6 @@ def _start_background_job(started_by: str, forced: bool) -> bool:
         return True
 
 
-# =========================
-# Routes
-# =========================
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
@@ -214,7 +184,6 @@ def health():
 @app.get("/status")
 def status():
     state = _read_state()
-    # Exponer resumen (sin secretos)
     return jsonify(
         {
             "ok": True,
@@ -225,6 +194,26 @@ def status():
             "log_file": str(LOG_FILE),
         }
     )
+
+
+@app.get("/log")
+def log_tail():
+    # Protege igual con token
+    token = (request.args.get("token") or "").strip()
+    if RUN_TOKEN and token != RUN_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    n = int(request.args.get("n", "120"))
+    n = max(10, min(n, 2000))
+
+    if not LOG_FILE.exists():
+        return jsonify({"ok": True, "lines": [], "note": "no log yet"})
+
+    try:
+        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        return jsonify({"ok": True, "lines": lines[-n:]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/run")
@@ -238,17 +227,9 @@ def run_daily():
 
     forced = (request.args.get("force") == "1") and ALLOW_FORCE
 
-    # Si es force, solo evitamos repetir si ya está corriendo
     if forced:
         started = _start_background_job(started_by="force", forced=True)
-        return jsonify(
-            {
-                "ok": True,
-                "forced": True,
-                "started": started,
-                "now": now.isoformat(timespec="seconds"),
-            }
-        )
+        return jsonify({"ok": True, "forced": True, "started": started, "now": now.isoformat(timespec="seconds")})
 
     should, reason = _should_run(now, state)
     if not should:
@@ -266,16 +247,8 @@ def run_daily():
         )
 
     started = _start_background_job(started_by="schedule", forced=False)
-    return jsonify(
-        {
-            "ok": True,
-            "started": started,
-            "reason": "started" if started else "already_running_in_process",
-            "now": now.isoformat(timespec="seconds"),
-        }
-    )
+    return jsonify({"ok": True, "started": started, "reason": "started" if started else "already_running_in_process", "now": now.isoformat(timespec="seconds")})
 
 
 if __name__ == "__main__":
-    # Para pruebas locales (Render usa gunicorn)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
