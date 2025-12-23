@@ -31,6 +31,14 @@ ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
 app.secret_key = os.getenv("SECRET_KEY", "").strip() or os.urandom(24)
 
 
+@app.get("/")
+def home():
+    # opción 1: health público
+    return redirect(url_for("health"))
+
+    # opción 2 (si prefieres mandar al login):
+    # return redirect(url_for("login"))
+
 def _password_ok(pw: str) -> bool:
     pw = (pw or "").strip()
     if not pw:

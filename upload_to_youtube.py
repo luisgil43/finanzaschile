@@ -2,17 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Sube el video a YouTube con compatibilidad para Python 3.9, imprime el canal
-autenticado, la privacidad efectiva y verifica el video subido (status/canal).
-Requiere credentials.json y generará token.json.
+Sube SOLO el SHORT a YouTube (para reducir RAM/tiempo y asegurar que salga).
+Imprime líneas parseables por server.py:
+
+  UPLOAD_RESULT kind=short id=XXXX privacy=public
 
 ✅ Render (headless): NO puede abrir navegador.
-   Debes setear en Render:
+   Debes setear:
    - YT_CREDENTIALS_JSON_B64
    - YT_TOKEN_JSON_B64
-
-✅ Nuevo (mínimo): si existe out/finanzas_hoy_short.mp4 lo sube también,
-PERO exige <= 60s para que sea Short real (cap/trunc se hace en make_video.sh).
 """
 
 import base64
@@ -26,7 +24,7 @@ from typing import Optional
 # --- Compatibilidad Python 3.9: evita AttributeError de importlib.metadata ---
 try:
     import importlib.metadata as _im  # stdlib
-    _ = _im.packages_distributions  # puede no existir en 3.9
+    _ = _im.packages_distributions
 except Exception:
     try:
         import importlib.metadata as _im
@@ -48,7 +46,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-# ===== Config =====
 BASE = Path(__file__).resolve().parent
 CREDENTIALS_FILE = BASE / "credentials.json"
 TOKEN_FILE = BASE / "token.json"
@@ -59,6 +56,7 @@ SCOPES = [
 ]
 
 SHORTS_MAX_SECONDS = float(os.getenv("YT_SHORTS_MAX_SECONDS", "60"))
+ONLY_SHORT = os.getenv("YT_ONLY_SHORT", "1") == "1"
 
 
 def _env_b64_present(name: str) -> bool:
@@ -111,13 +109,6 @@ def get_service():
                     "YT_TOKEN_JSON_B64 / YT_CREDENTIALS_JSON_B64 en Render."
                 ) from e
 
-            print(f"⚠️ Token inválido/expirado ({e}). Eliminando token.json y pidiendo login de nuevo...")
-            try:
-                if token_file.exists():
-                    token_file.unlink()
-            except Exception as rm_err:
-                print(f"⚠️ No se pudo borrar token.json: {rm_err}")
-
             flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
             creds = flow.run_local_server(port=0)
 
@@ -135,18 +126,11 @@ def whoami(youtube):
     return ch.get("id"), ch.get("snippet", {}).get("title")
 
 
-def upload_video(
-    youtube,
-    video_path: Path,
-    title: str,
-    description: str,
-    privacy: str = "public",
-) -> Optional[str]:
+def upload_video(youtube, video_path: Path, title: str, description: str, privacy: str) -> Optional[str]:
     body = {
         "snippet": {"title": title, "description": description, "categoryId": "22"},
         "status": {"privacyStatus": privacy},
     }
-
     media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)
     req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
@@ -167,9 +151,7 @@ def _ffprobe_duration_seconds(path: Path) -> Optional[float]:
             text=True,
             check=True,
         ).stdout.strip()
-        if not out:
-            return None
-        return float(out)
+        return float(out) if out else None
     except Exception:
         return None
 
@@ -179,52 +161,37 @@ def main():
     ch_id, ch_title = whoami(youtube)
     print(f"👤 Canal autenticado: {ch_title} ({ch_id})")
 
-    video = BASE / "out" / "finanzas_hoy.mp4"
-    if not video.exists():
-        print(f"❌ No existe el video: {video}")
+    # SOLO short
+    short_video = BASE / "out" / "finanzas_hoy_short.mp4"
+    if not short_video.exists():
+        print(f"❌ No existe el short: {short_video}")
         sys.exit(1)
 
-    short_video = BASE / "out" / "finanzas_hoy_short.mp4"
+    dur = _ffprobe_duration_seconds(short_video)
+    if dur is None:
+        print("⚠️ No pude leer duración del short con ffprobe. Igual lo intentaré subir.")
+    elif dur > SHORTS_MAX_SECONDS:
+        print(f"⚠️ Short dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s. (Revisa make_video.sh cap 59s)")
+        # Igual intento subir si quieres forzar:
+        if os.getenv("YT_ALLOW_OVER_60", "0") != "1":
+            sys.exit(2)
 
     date_str = dt.datetime.now().strftime("%Y-%m-%d")
-    title_tpl = os.getenv("YT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date}")
-    title = title_tpl.format(date=date_str)
-    description = os.getenv("YT_DESCRIPTION", "Resumen diario de indicadores y mercados.")
     privacy = os.getenv("YT_PRIVACY", "public")
 
     short_title_tpl = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date} #Shorts")
     short_title = short_title_tpl.format(date=date_str)
 
+    description = os.getenv("YT_DESCRIPTION", "Resumen diario de indicadores y mercados.")
+    desc_short = description or ""
+    if "#shorts" not in desc_short.lower():
+        desc_short = desc_short.rstrip() + "\n\n#Shorts"
+
     try:
-        # 1) Video normal
-        vid = upload_video(youtube, video, title=title, description=description, privacy=privacy)
-        print(f"✅ Video subido. ID: {vid} | privacidad: {privacy}")
-        if vid:
-            # línea parseable para el server
-            print(f"UPLOAD_RESULT kind=normal id={vid} privacy={privacy}")
-
-        # 2) Short
-        if short_video.exists():
-            dur = _ffprobe_duration_seconds(short_video)
-            if dur is None:
-                print("⚠️ No pude leer duración del short con ffprobe. No lo subo por seguridad.")
-            elif dur > SHORTS_MAX_SECONDS:
-                print(
-                    f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s. "
-                    f"Solución: cap/trunc en make_video.sh (recomendado 59s)."
-                )
-            else:
-                desc_short = description or ""
-                if "#shorts" not in desc_short.lower():
-                    desc_short = desc_short.rstrip() + "\n\n#Shorts"
-
-                vid_s = upload_video(youtube, short_video, title=short_title, description=desc_short, privacy=privacy)
-                print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
-                if vid_s:
-                    print(f"UPLOAD_RESULT kind=short id={vid_s} privacy={privacy}")
-        else:
-            print("ℹ️ No existe out/finanzas_hoy_short.mp4, no se sube short.")
-
+        vid_s = upload_video(youtube, short_video, title=short_title, description=desc_short, privacy=privacy)
+        print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
+        if vid_s:
+            print(f"UPLOAD_RESULT kind=short id={vid_s} privacy={privacy}")
     except HttpError as e:
         print(f"❌ Error YouTube API: {e}")
         raise
