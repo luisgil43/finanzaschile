@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from flask import (Flask, jsonify, redirect, render_template_string, request,
                    session, url_for)
-from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.security import check_password_hash
 
 # =========================
 # Flask app
@@ -29,6 +29,7 @@ ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
 # SECRET_KEY para sesiones (OBLIGATORIO en Render)
 app.secret_key = os.getenv("SECRET_KEY", "").strip() or os.urandom(24)
 
+
 def _password_ok(pw: str) -> bool:
     pw = (pw or "").strip()
     if not pw:
@@ -41,12 +42,14 @@ def _password_ok(pw: str) -> bool:
         return pw == ADMIN_PASSWORD
     return False
 
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not session.get("logged_in"):
             return redirect(url_for("login", next=request.path))
         return fn(*args, **kwargs)
+
     return wrapper
 
 
@@ -78,6 +81,7 @@ _background_thread = None
 def _tz_now() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo  # py3.9+
+
         return dt.datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
         return dt.datetime.now()
@@ -105,9 +109,37 @@ def _append_log(line: str) -> None:
         f.write(line.rstrip() + "\n")
 
 
+# ✅ FIX MEMORIA:
+# Antes: subprocess.run(capture_output=True) => guarda stdout/err gigantes en RAM (ffmpeg/yfinance/upload)
+# Ahora: streamea stdout/stderr al log en tiempo real y solo "captura" líneas UPLOAD_RESULT para parsear IDs.
 def _run(cmd) -> Tuple[int, str, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return p.returncode, (p.stdout or ""), (p.stderr or "")
+    """
+    Ejecuta comando y streamea stdout/stderr a LOG_FILE (sin llenar RAM).
+    Retorna:
+      - returncode
+      - stdout_min: solo líneas "UPLOAD_RESULT ..." (para parsear IDs)
+      - stderr_min: vacío (mezclamos stderr en stdout)
+    """
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    upload_lines: List[str] = []
+    if p.stdout:
+        for line in p.stdout:
+            s = (line or "").rstrip()
+            if s:
+                _append_log(s)
+                if s.startswith("UPLOAD_RESULT "):
+                    upload_lines.append(s)
+
+    code = p.wait()
+    return code, "\n".join(upload_lines), ""
 
 
 def _acquire_lock_nonblocking():
@@ -168,7 +200,7 @@ def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
         line = line.strip()
         if not line.startswith("UPLOAD_RESULT "):
             continue
-        payload = line[len("UPLOAD_RESULT "):].strip()
+        payload = line[len("UPLOAD_RESULT ") :].strip()
         parts = payload.split()
         d = {}
         for p in parts:
@@ -177,7 +209,6 @@ def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
             k, v = p.split("=", 1)
             d[k.strip()] = v.strip()
         if d.get("id"):
-            # url rápida
             vid = d["id"]
             d["url_watch"] = f"https://www.youtube.com/watch?v={vid}"
             d["url_shorts"] = f"https://www.youtube.com/shorts/{vid}"
@@ -196,7 +227,9 @@ def _run_pipeline_job(started_by: str, forced: bool):
     state["last_error_step"] = None
     _write_state(state)
 
-    _append_log(f"\n=== START {state['last_started_at']} by={started_by} forced={forced} ===")
+    _append_log(
+        f"\n=== START {state['last_started_at']} by={started_by} forced={forced} ==="
+    )
 
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
@@ -210,13 +243,11 @@ def _run_pipeline_job(started_by: str, forced: bool):
     try:
         for name, cmd in _pipeline_steps():
             _append_log(f"[STEP] {name}: {' '.join(cmd)}")
+
             code, out, err = _run(cmd)
 
-            # log
-            if out:
-                _append_log(out)
-            if err:
-                _append_log(err)
+            # ✅ YA NO volvemos a _append_log(out/err) porque _run() ya streamea al log en vivo
+            # (out/err ahora solo contiene líneas UPLOAD_RESULT, si existen)
 
             # si fue upload, parsea IDs y guarda en state
             if name == "upload":
@@ -224,11 +255,9 @@ def _run_pipeline_job(started_by: str, forced: bool):
                 if uploads:
                     st = _read_state()
                     st.setdefault("uploads", [])
-                    # agrega timestamp al resultado
                     ts = _tz_now().isoformat(timespec="seconds")
                     for u in uploads:
                         u["ts"] = ts
-                    # prepend (más nuevo primero)
                     st["uploads"] = (uploads + st["uploads"])[:50]
                     _write_state(st)
 
@@ -285,11 +314,13 @@ def _read_enap() -> Dict:
             return {}
     return {}
 
+
 def _write_enap(data: Dict) -> None:
     ENAP_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = ENAP_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(ENAP_FILE)
+
 
 def _safe_int(x: str) -> Optional[int]:
     x = (x or "").strip().replace(".", "").replace(",", "")
@@ -299,6 +330,7 @@ def _safe_int(x: str) -> Optional[int]:
         return int(float(x))
     except Exception:
         return None
+
 
 def _tail_log(n: int = 200) -> str:
     try:
@@ -421,6 +453,7 @@ LOGIN_HTML = """
 </html>
 """
 
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     err = None
@@ -434,10 +467,12 @@ def login():
         err = "Credenciales inválidas."
     return render_template_string(LOGIN_HTML, error=err)
 
+
 @app.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
 
 ADMIN_HTML = """
 <!doctype html>
@@ -530,12 +565,12 @@ ADMIN_HTML = """
 </html>
 """
 
+
 @app.get("/admin")
 @login_required
 def admin():
     state = _read_state()
     uploads = state.get("uploads") or []
-    # por seguridad, no expongas el token real si no quieres; si quieres ocultarlo, deja vacío.
     run_token = os.getenv("RUN_TOKEN", "").strip()
     return render_template_string(
         ADMIN_HTML,
@@ -544,6 +579,7 @@ def admin():
         log_tail=_tail_log(200),
         run_token=run_token,
     )
+
 
 FUEL_HTML = """
 <!doctype html>
@@ -610,6 +646,7 @@ FUEL_HTML = """
 </html>
 """
 
+
 @app.route("/admin/fuel", methods=["GET", "POST"])
 @login_required
 def fuel():
@@ -624,7 +661,6 @@ def fuel():
         diesel = _safe_int(request.form.get("diesel", ""))
         vig = (request.form.get("vigencia") or "").strip()
 
-        # Guardamos solo lo que tu fetcher ya usa
         payload = {
             "vigencia": vig if vig else "",
             "g93_clp_l": g93,
