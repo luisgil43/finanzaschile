@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+from collections import deque
 from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,7 +39,6 @@ def _password_ok(pw: str) -> bool:
         return check_password_hash(ADMIN_PASSWORD_HASH, pw)
     # fallback: password plano en env
     if ADMIN_PASSWORD:
-        # comparación simple (en env igual sirve para proyecto personal)
         return pw == ADMIN_PASSWORD
     return False
 
@@ -58,9 +58,7 @@ def login_required(fn):
 # =========================
 RUN_TOKEN = os.getenv("RUN_TOKEN", "").strip()
 
-# Zona horaria (Render)
 TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
-
 RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
 RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
 ALLOW_FORCE = os.getenv("ALLOW_FORCE", "1") == "1"
@@ -109,9 +107,26 @@ def _append_log(line: str) -> None:
         f.write(line.rstrip() + "\n")
 
 
+def _log_mem(tag: str) -> None:
+    """
+    Loguea MemAvailable (Linux) para detectar el step que revienta memoria.
+    No rompe si /proc/meminfo no existe.
+    """
+    try:
+        avail_kb = None
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail_kb = line.split()[1]
+                    break
+        _append_log(f"[MEM] {tag} MemAvailable_kB={avail_kb}")
+    except Exception:
+        pass
+
+
 # ✅ FIX MEMORIA:
-# Antes: subprocess.run(capture_output=True) => guarda stdout/err gigantes en RAM (ffmpeg/yfinance/upload)
-# Ahora: streamea stdout/stderr al log en tiempo real y solo "captura" líneas UPLOAD_RESULT para parsear IDs.
+# Antes: subprocess.run(capture_output=True) => guardaba stdout/err gigantes en RAM
+# Ahora: streamea stdout/stderr al log en tiempo real y solo "captura" líneas UPLOAD_RESULT
 def _run(cmd) -> Tuple[int, str, str]:
     """
     Ejecuta comando y streamea stdout/stderr a LOG_FILE (sin llenar RAM).
@@ -230,6 +245,7 @@ def _run_pipeline_job(started_by: str, forced: bool):
     _append_log(
         f"\n=== START {state['last_started_at']} by={started_by} forced={forced} ==="
     )
+    _log_mem("pipeline_start")
 
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
@@ -243,11 +259,11 @@ def _run_pipeline_job(started_by: str, forced: bool):
     try:
         for name, cmd in _pipeline_steps():
             _append_log(f"[STEP] {name}: {' '.join(cmd)}")
+            _log_mem(f"before_{name}")
 
             code, out, err = _run(cmd)
 
-            # ✅ YA NO volvemos a _append_log(out/err) porque _run() ya streamea al log en vivo
-            # (out/err ahora solo contiene líneas UPLOAD_RESULT, si existen)
+            _log_mem(f"after_{name}")
 
             # si fue upload, parsea IDs y guarda en state
             if name == "upload":
@@ -277,6 +293,7 @@ def _run_pipeline_job(started_by: str, forced: bool):
         st["last_success_date"] = finished.date().isoformat()
         _write_state(st)
         _append_log(f"=== SUCCESS {st['last_finished_at']} ===")
+        _log_mem("pipeline_success")
 
     finally:
         try:
@@ -332,12 +349,13 @@ def _safe_int(x: str) -> Optional[int]:
         return None
 
 
+# ✅ FIX: tail sin leer TODO el archivo a RAM
 def _tail_log(n: int = 200) -> str:
     try:
         if not LOG_FILE.exists():
             return ""
-        lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
-        return "\n".join(lines[-n:])
+        with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
+            return "".join(deque(f, maxlen=n))
     except Exception:
         return ""
 
@@ -597,7 +615,6 @@ FUEL_HTML = """
     input{width:100%;padding:12px;border-radius:12px;border:1px solid #78B0FF;background:#0B2B57;color:#fff}
     button{margin-top:14px;padding:12px 14px;border-radius:12px;border:0;background:#5CA9FF;color:#001a33;font-weight:700}
     .row{display:flex;gap:10px;flex-wrap:wrap}
-    .pill{background:#0B2B57;border:1px solid #78B0FF;border-radius:999px;padding:6px 10px}
     .ok{color:#b7ffcf}
     .err{color:#ffb4b4}
     .btn{display:inline-block;background:#5CA9FF;color:#001a33;font-weight:700;padding:8px 12px;border-radius:12px}
