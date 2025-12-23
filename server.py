@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import threading
-from collections import deque
 from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,23 +20,42 @@ app = Flask(__name__)
 # =========================
 # Auth (sin DB)
 # =========================
-# Opción A (simple): ADMIN_USER + ADMIN_PASSWORD
-# Opción B (mejor): ADMIN_USER + ADMIN_PASSWORD_HASH (pbkdf2:sha256...)
 ADMIN_USER = os.getenv("ADMIN_USER", "admin").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
 
-# SECRET_KEY para sesiones (OBLIGATORIO en Render)
+# IMPORTANTÍSIMO: setea SECRET_KEY en Render (si no, cada restart mata la sesión)
 app.secret_key = os.getenv("SECRET_KEY", "").strip() or os.urandom(24)
 
+# =========================
+# Runtime / Schedule
+# =========================
+RUN_TOKEN = os.getenv("RUN_TOKEN", "").strip()
+TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
 
-@app.get("/")
-def home():
-    # opción 1: health público
-    return redirect(url_for("health"))
+RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
+RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
+ALLOW_FORCE = os.getenv("ALLOW_FORCE", "1") == "1"
 
-    # opción 2 (si prefieres mandar al login):
-    # return redirect(url_for("login"))
+RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", "/tmp/finanzaschile"))
+STATE_FILE = RUNTIME_DIR / "state.json"
+LOCK_FILE = RUNTIME_DIR / "run.lock"
+LOG_FILE = RUNTIME_DIR / "last_run.log"
+
+# Limita crecimiento del log para NO reventar RAM (admin tail)
+MAX_LOG_BYTES = int(os.getenv("MAX_LOG_BYTES", "1000000"))  # 1MB default
+TAIL_BYTES = int(os.getenv("TAIL_BYTES", "250000"))         # 250KB default
+
+BASE_DIR = Path(__file__).resolve().parent
+ENAP_FILE = BASE_DIR / "sources" / "enap_semana.json"
+LATEST_JSON = BASE_DIR / "data" / "latest.json"
+
+IS_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
+SHORT_ONLY = os.getenv("SHORT_ONLY", "1" if IS_RENDER else "0") == "1"
+
+_thread_guard = threading.Lock()
+_background_thread = None
+
 
 def _password_ok(pw: str) -> bool:
     pw = (pw or "").strip()
@@ -45,7 +63,6 @@ def _password_ok(pw: str) -> bool:
         return False
     if ADMIN_PASSWORD_HASH:
         return check_password_hash(ADMIN_PASSWORD_HASH, pw)
-    # fallback: password plano en env
     if ADMIN_PASSWORD:
         return pw == ADMIN_PASSWORD
     return False
@@ -57,37 +74,12 @@ def login_required(fn):
         if not session.get("logged_in"):
             return redirect(url_for("login", next=request.path))
         return fn(*args, **kwargs)
-
     return wrapper
-
-
-# =========================
-# Config runtime / schedule
-# =========================
-RUN_TOKEN = os.getenv("RUN_TOKEN", "").strip()
-
-TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
-RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
-RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
-ALLOW_FORCE = os.getenv("ALLOW_FORCE", "1") == "1"
-
-RUNTIME_DIR = Path(os.getenv("RUNTIME_DIR", "/tmp/finanzaschile"))
-STATE_FILE = RUNTIME_DIR / "state.json"
-LOCK_FILE = RUNTIME_DIR / "run.lock"
-LOG_FILE = RUNTIME_DIR / "last_run.log"
-
-# Archivo de combustibles editable
-BASE_DIR = Path(__file__).resolve().parent
-ENAP_FILE = BASE_DIR / "sources" / "enap_semana.json"
-
-_thread_guard = threading.Lock()
-_background_thread = None
 
 
 def _tz_now() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-
         return dt.datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
         return dt.datetime.now()
@@ -109,40 +101,79 @@ def _write_state(state: Dict) -> None:
     tmp.replace(STATE_FILE)
 
 
+def _truncate_log_if_needed() -> None:
+    try:
+        if not LOG_FILE.exists():
+            return
+        sz = LOG_FILE.stat().st_size
+        if sz <= MAX_LOG_BYTES:
+            return
+
+        # conservamos solo los últimos TAIL_BYTES
+        keep = min(TAIL_BYTES, sz)
+        with LOG_FILE.open("rb") as f:
+            f.seek(-keep, os.SEEK_END)
+            chunk = f.read(keep)
+
+        # corta a líneas completas
+        text = chunk.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+        # si quedó muy corto, igual sirve
+        out = "\n".join(lines[-2000:]) + "\n"
+
+        tmp = LOG_FILE.with_suffix(".tmp")
+        tmp.write_text(out, encoding="utf-8")
+        tmp.replace(LOG_FILE)
+    except Exception:
+        # si falla, no rompas el pipeline
+        return
+
+
 def _append_log(line: str) -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line.rstrip() + "\n")
+    _truncate_log_if_needed()
 
 
-def _log_mem(tag: str) -> None:
+def _tail_log(n_lines: int = 250) -> str:
     """
-    Loguea MemAvailable (Linux) para detectar el step que revienta memoria.
-    No rompe si /proc/meminfo no existe.
+    Lee solo el final del archivo (bytes), evita cargar el log completo a RAM.
     """
     try:
-        avail_kb = None
-        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    avail_kb = line.split()[1]
-                    break
-        _append_log(f"[MEM] {tag} MemAvailable_kB={avail_kb}")
+        if not LOG_FILE.exists():
+            return ""
+        sz = LOG_FILE.stat().st_size
+        if sz <= 0:
+            return ""
+
+        read_bytes = min(TAIL_BYTES, sz)
+        with LOG_FILE.open("rb") as f:
+            f.seek(-read_bytes, os.SEEK_END)
+            chunk = f.read(read_bytes)
+
+        text = chunk.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+        return "\n".join(lines[-n_lines:])
     except Exception:
-        pass
+        return ""
 
 
-# ✅ FIX MEMORIA:
-# Antes: subprocess.run(capture_output=True) => guardaba stdout/err gigantes en RAM
-# Ahora: streamea stdout/stderr al log en tiempo real y solo "captura" líneas UPLOAD_RESULT
-def _run(cmd) -> Tuple[int, str, str]:
-    """
-    Ejecuta comando y streamea stdout/stderr a LOG_FILE (sin llenar RAM).
-    Retorna:
-      - returncode
-      - stdout_min: solo líneas "UPLOAD_RESULT ..." (para parsear IDs)
-      - stderr_min: vacío (mezclamos stderr en stdout)
-    """
+def _read_latest_json() -> Dict:
+    try:
+        if not LATEST_JSON.exists():
+            return {}
+        return json.loads(LATEST_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# ✅ FIX MEMORIA: NO capture_output gigante
+def _run(cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -150,6 +181,7 @@ def _run(cmd) -> Tuple[int, str, str]:
         text=True,
         bufsize=1,
         universal_newlines=True,
+        env=env,
     )
 
     upload_lines: List[str] = []
@@ -166,9 +198,6 @@ def _run(cmd) -> Tuple[int, str, str]:
 
 
 def _acquire_lock_nonblocking():
-    """
-    Lock de proceso/worker (fcntl). Si ya hay uno corriendo, no ejecuta.
-    """
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     fp = LOCK_FILE.open("w")
     try:
@@ -180,8 +209,7 @@ def _acquire_lock_nonblocking():
 
 
 def _within_run_window(now: dt.datetime) -> bool:
-    # Lunes=0 ... Domingo=6
-    is_weekday = now.weekday() <= 4
+    is_weekday = now.weekday() <= 4  # lun-vie
     if not is_weekday:
         return False
     if now.hour != RUN_HOUR:
@@ -192,12 +220,10 @@ def _within_run_window(now: dt.datetime) -> bool:
 def _should_run(now: dt.datetime, state: Dict) -> Tuple[bool, str]:
     if not _within_run_window(now):
         return False, "outside_schedule"
-
     today = now.date().isoformat()
     last_ok = (state.get("last_success_date") or "").strip()
     if last_ok == today:
         return False, "already_ran_today"
-
     return True, "ok_to_run"
 
 
@@ -212,11 +238,6 @@ def _pipeline_steps():
 
 
 def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
-    """
-    Lee líneas tipo:
-      UPLOAD_RESULT kind=normal id=XXXX title=... privacy=public
-    Devuelve lista de dicts.
-    """
     results = []
     text = (stdout or "") + "\n" + (stderr or "")
     for line in text.splitlines():
@@ -250,10 +271,7 @@ def _run_pipeline_job(started_by: str, forced: bool):
     state["last_error_step"] = None
     _write_state(state)
 
-    _append_log(
-        f"\n=== START {state['last_started_at']} by={started_by} forced={forced} ==="
-    )
-    _log_mem("pipeline_start")
+    _append_log(f"\n=== START {state['last_started_at']} by={started_by} forced={forced} short_only={SHORT_ONLY} ===")
 
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
@@ -267,13 +285,18 @@ def _run_pipeline_job(started_by: str, forced: bool):
     try:
         for name, cmd in _pipeline_steps():
             _append_log(f"[STEP] {name}: {' '.join(cmd)}")
-            _log_mem(f"before_{name}")
 
-            code, out, err = _run(cmd)
+            # En Render por defecto solo short (reduce RAM)
+            extra_env: Dict[str, str] = {}
+            if SHORT_ONLY and name == "make_video":
+                extra_env.setdefault("GENERATE_FULL_VIDEO", "0")
+                extra_env.setdefault("GENERATE_SHORT_VIDEO", "1")
+            if SHORT_ONLY and name == "upload":
+                extra_env.setdefault("UPLOAD_NORMAL", "0")
+                extra_env.setdefault("UPLOAD_SHORT", "1")
 
-            _log_mem(f"after_{name}")
+            code, out, err = _run(cmd, extra_env=extra_env if extra_env else None)
 
-            # si fue upload, parsea IDs y guarda en state
             if name == "upload":
                 uploads = _parse_upload_results(out, err)
                 if uploads:
@@ -301,7 +324,6 @@ def _run_pipeline_job(started_by: str, forced: bool):
         st["last_success_date"] = finished.date().isoformat()
         _write_state(st)
         _append_log(f"=== SUCCESS {st['last_finished_at']} ===")
-        _log_mem("pipeline_success")
 
     finally:
         try:
@@ -329,7 +351,7 @@ def _start_background_job(started_by: str, forced: bool) -> bool:
 
 
 # =========================
-# Fuel file helpers (sin DB)
+# Fuel file helpers
 # =========================
 def _read_enap() -> Dict:
     if ENAP_FILE.exists():
@@ -357,20 +379,16 @@ def _safe_int(x: str) -> Optional[int]:
         return None
 
 
-# ✅ FIX: tail sin leer TODO el archivo a RAM
-def _tail_log(n: int = 200) -> str:
-    try:
-        if not LOG_FILE.exists():
-            return ""
-        with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
-            return "".join(deque(f, maxlen=n))
-    except Exception:
-        return ""
+# =========================
+# Routes: base
+# =========================
+@app.get("/")
+def home():
+    if session.get("logged_in"):
+        return redirect(url_for("admin"))
+    return redirect(url_for("login"))
 
 
-# =========================
-# Routes: public
-# =========================
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
@@ -385,6 +403,7 @@ def status():
             "tz": TZ_NAME,
             "run_hour": RUN_HOUR,
             "run_window_minutes": RUN_WINDOW_MINUTES,
+            "short_only": SHORT_ONLY,
             "state": state,
             "log_file": str(LOG_FILE),
         }
@@ -404,14 +423,7 @@ def run_daily():
 
     if forced:
         started = _start_background_job(started_by="force", forced=True)
-        return jsonify(
-            {
-                "ok": True,
-                "forced": True,
-                "started": started,
-                "now": now.isoformat(timespec="seconds"),
-            }
-        )
+        return jsonify({"ok": True, "forced": True, "started": started, "now": now.isoformat(timespec="seconds")})
 
     should, reason = _should_run(now, state)
     if not should:
@@ -429,18 +441,11 @@ def run_daily():
         )
 
     started = _start_background_job(started_by="schedule", forced=False)
-    return jsonify(
-        {
-            "ok": True,
-            "started": started,
-            "reason": "started" if started else "already_running_in_process",
-            "now": now.isoformat(timespec="seconds"),
-        }
-    )
+    return jsonify({"ok": True, "started": started, "reason": "started" if started else "already_running_in_process", "now": now.isoformat(timespec="seconds")})
 
 
 # =========================
-# Routes: admin login/UI
+# Routes: login/UI
 # =========================
 LOGIN_HTML = """
 <!doctype html>
@@ -471,7 +476,7 @@ LOGIN_HTML = """
         <input name="password" type="password" autocomplete="current-password" required />
         <button type="submit">Entrar</button>
         {% if error %}<div class="err">{{ error }}</div>{% endif %}
-        <div class="muted">Tip: define ADMIN_USER / ADMIN_PASSWORD o ADMIN_PASSWORD_HASH en Render.</div>
+        <div class="muted">Define ADMIN_USER + ADMIN_PASSWORD_HASH (recomendado) o ADMIN_PASSWORD.</div>
       </form>
     </div>
   </div>
@@ -523,6 +528,7 @@ ADMIN_HTML = """
     th,td{border-bottom:1px solid rgba(92,169,255,.25);padding:10px;text-align:left}
     th{color:#CFE6FF}
     .btn{display:inline-block;background:#5CA9FF;color:#001a33;font-weight:700;padding:8px 12px;border-radius:12px}
+    .muted{color:#BFD8FF;font-size:13px}
   </style>
 </head>
 <body>
@@ -545,41 +551,56 @@ ADMIN_HTML = """
           <div class="pill"><span class="k">finished:</span> {{ state.get('last_finished_at') }}</div>
           <div class="pill"><span class="k">last_success_date:</span> {{ state.get('last_success_date') }}</div>
           <div class="pill"><span class="k">error_step:</span> {{ state.get('last_error_step') }}</div>
+          <div class="pill"><span class="k">short_only:</span> {{ short_only }}</div>
         </div>
         <div style="margin-top:10px">
           <a class="btn" href="/run?token={{ run_token }}&force=1" target="_blank">▶️ Forzar run ahora</a>
-          <span style="color:#BFD8FF;font-size:13px;margin-left:10px">*usa tu RUN_TOKEN</span>
+          <span class="muted" style="margin-left:10px">*usa tu RUN_TOKEN</span>
         </div>
       </div>
 
       <div class="card">
-        <h3>Últimos uploads detectados</h3>
-        {% if uploads %}
-          <table>
-            <thead>
-              <tr>
-                <th>Fecha</th><th>Tipo</th><th>ID</th><th>Links</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for u in uploads %}
-              <tr>
-                <td>{{ u.get('ts') }}</td>
-                <td>{{ u.get('kind') }}</td>
-                <td>{{ u.get('id') }}</td>
-                <td>
-                  <a href="{{ u.get('url_watch') }}" target="_blank">watch</a>
-                  &nbsp;|&nbsp;
-                  <a href="{{ u.get('url_shorts') }}" target="_blank">shorts</a>
-                </td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+        <h3>latest.json (debug rápido)</h3>
+        {% if latest %}
+          <div class="row">
+            <div class="pill"><span class="k">cobre_usd_lb:</span> {{ latest.get('cobre_usd_lb') }}</div>
+            <div class="pill"><span class="k">brent_usd:</span> {{ latest.get('brent_usd') }}</div>
+            <div class="pill"><span class="k">generated_at:</span> {{ latest.get('generated_at') }}</div>
+          </div>
+          <div class="muted" style="margin-top:8px">
+            Si cobre sale None aquí, el panel va a mostrar N/D (falló el fetch en ese run).
+          </div>
         {% else %}
-          <div style="color:#BFD8FF">Aún no hay uploads guardados. (Se llenará cuando corra el step upload)</div>
+          <div class="muted">No existe data/latest.json todavía (aún no corre fetch_to_json en este contenedor).</div>
         {% endif %}
       </div>
+    </div>
+
+    <div class="card">
+      <h3>Últimos uploads detectados</h3>
+      {% if uploads %}
+        <table>
+          <thead>
+            <tr><th>Fecha</th><th>Tipo</th><th>ID</th><th>Links</th></tr>
+          </thead>
+          <tbody>
+            {% for u in uploads %}
+            <tr>
+              <td>{{ u.get('ts') }}</td>
+              <td>{{ u.get('kind') }}</td>
+              <td>{{ u.get('id') }}</td>
+              <td>
+                <a href="{{ u.get('url_watch') }}" target="_blank">watch</a>
+                &nbsp;|&nbsp;
+                <a href="{{ u.get('url_shorts') }}" target="_blank">shorts</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <div class="muted">Aún no hay uploads guardados. (Se llena cuando corre el step upload)</div>
+      {% endif %}
     </div>
 
     <div class="card">
@@ -598,12 +619,15 @@ def admin():
     state = _read_state()
     uploads = state.get("uploads") or []
     run_token = os.getenv("RUN_TOKEN", "").strip()
+    latest = _read_latest_json()
     return render_template_string(
         ADMIN_HTML,
         state=state,
         uploads=uploads[:20],
-        log_tail=_tail_log(200),
+        log_tail=_tail_log(250),
         run_token=run_token,
+        latest=latest,
+        short_only=SHORT_ONLY,
     )
 
 
@@ -640,9 +664,7 @@ FUEL_HTML = """
     </div>
 
     <div class="card">
-      <div class="muted">
-        Esto edita <code>sources/enap_semana.json</code>. Puedes dejar vigencia vacío si no quieres fechas.
-      </div>
+      <div class="muted">Edita <code>sources/enap_semana.json</code>.</div>
 
       {% if msg %}<div class="ok" style="margin-top:10px">✅ {{ msg }}</div>{% endif %}
       {% if error %}<div class="err" style="margin-top:10px">❌ {{ error }}</div>{% endif %}

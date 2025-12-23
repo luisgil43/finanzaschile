@@ -53,3 +53,4 @@ websockets==15.0.1
 Werkzeug==3.1.4
 yfinance==0.2.43
 zipp==3.23.0
+edge-tts==6.1.12

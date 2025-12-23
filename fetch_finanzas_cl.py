@@ -1,396 +1,358 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+fetch_finanzas_cl.py
+- Fuentes robustas y SILENCIOSAS para Cobre/Brent:
+  Stooq primero, y Yahoo Chart API (requests) como fallback.
+- Mantiene load_last_ok() para fallback cuando hay reinicios.
+- main() imprime salida estilo consola (para debug local).
+
+NOTA:
+- Evitamos yfinance como fallback porque mete prints/logs raros y a veces falla JSON.
+"""
+
 import datetime as dt
 import json
-import os
-import time
-import xml.etree.ElementTree as ET
+import logging
 from pathlib import Path
-from statistics import mean
+from typing import Any, Dict, Optional
 
 import requests
-import yfinance as yf
 
-# =======================
-# Config & Constantes
-# =======================
-HDR = {"User-Agent": "finanzas-hoy/1.0 (+github)"}
-CNE_BASE = "https://api.cne.cl"  # Bencina en Línea (no usado ahora)
-BASE = Path(__file__).resolve().parent
-DATA_DIR = BASE / "data"
+# =========================
+# Paths
+# =========================
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+SOURCES_DIR = BASE_DIR / "sources"
+
 LATEST_JSON = DATA_DIR / "latest.json"
+LAST_OK_JSON = DATA_DIR / "last_ok.json"
 
-# =======================
-# Fecha en español (sin depender de locale del sistema)
-# =======================
-_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+ENAP_FILE = SOURCES_DIR / "enap_semana.json"
+COBRE_OFICIAL_FILE = SOURCES_DIR / "cobre_oficial.json"  # opcional si quieres tener uno local
 
-def fecha_es_hoy():
-    hoy = dt.datetime.now()
-    dia = _DIAS_ES[hoy.weekday()].capitalize()
-    return f"{dia} {hoy:%d/%m/%Y}"
+# =========================
+# HTTP helpers
+# =========================
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 
-# =======================
-# Helpers de formato
-# =======================
-def fmt_clp(n):
+
+def _http_get(url: str, timeout: int = 15) -> requests.Response:
+    return requests.get(url, timeout=timeout, headers={"User-Agent": _UA})
+
+
+def _safe_float(x: Any) -> Optional[float]:
     try:
-        s = f"{round(float(n)):,}".replace(",", ".")
-        return f"$ {s}"
-    except Exception:
-        return "N/D"
-
-def fmt_usd(n, decimals=0):
-    if n is None:
-        return "N/D"
-    try:
-        if decimals == 0:
-            return f"${round(float(n)):,}"
-        return f"${float(n):,.{decimals}f}"
-    except Exception:
-        return "N/D"
-
-def fmt_float(n, decimals=2):
-    if n is None:
-        return "N/D"
-    try:
-        return f"{float(n):.{decimals}f}"
-    except Exception:
-        return "N/D"
-
-# =======================
-# HTTP con reintentos (para red inestable)
-# =======================
-def http_get(url, *, params=None, headers=None, timeout=20, tries=5, backoff=2.0):
-    """
-    GET con reintentos exponenciales: 1, 2, 4, 8, ...
-    Lanza la última excepción si se agotan.
-    """
-    headers = headers or HDR
-    last = None
-    for i in range(tries):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last = e
-            time.sleep(backoff ** i)
-    raise last
-
-# =======================
-# Fetchers principales
-# =======================
-def get_mindicador():
-    """Dólar, UF, UTM (Chile) desde mindicador.cl"""
-    r = http_get("https://mindicador.cl/api", headers=HDR, timeout=20, tries=5, backoff=2.0)
-    j = r.json()
-    return {
-        "fecha": j["fecha"][:10],
-        "dolar_clp": float(j["dolar"]["valor"]),
-        "uf_clp": float(j["uf"]["valor"]),
-        "utm_clp": float(j["utm"]["valor"]),
-    }
-
-def get_crypto():
-    """BTC y ETH en USD desde CoinGecko (simple/rápido)."""
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": "bitcoin,ethereum", "vs_currencies": "usd"}
-    r = http_get(url, params=params, headers=HDR, timeout=20, tries=4, backoff=2.0)
-    j = r.json()
-    return {
-        "btc_usd": float(j["bitcoin"]["usd"]),
-        "eth_usd": float(j["ethereum"]["usd"]),
-    }
-
-def get_brent():
-    """Brent USD/bbl usando Yahoo Finance."""
-    try:
-        t = yf.Ticker("BZ=F")  # Brent Crude Oil
-        d = t.history(period="1d")
-        if d.empty:
-            return {"brent_usd": None}
-        return {"brent_usd": float(d["Close"].iloc[-1])}
-    except Exception:
-        return {"brent_usd": None}
-
-def get_cobre_comex():
-    """Cobre en USD/lb (aprox) usando futuro de cobre COMEX (HG=F)."""
-    try:
-        t = yf.Ticker("HG=F")
-        d = t.history(period="1d")
-        if d.empty:
-            return {"cobre_usd_lb": None}
-        return {"cobre_usd_lb": float(d["Close"].iloc[-1])}
-    except Exception:
-        return {"cobre_usd_lb": None}
-
-# =======================
-# Lecturas locales/overrides
-# =======================
-def load_json_if_exists(path: Path):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        if x is None:
             return None
-    return None
-
-def get_cobre_oficial_local():
-    """
-    sources/cochilco_override.json (opcional):
-    { "cobre_usd_lb": 4.12, "fecha": "YYYY-MM-DD", "fuente": "Cochilco (oficial)" }
-    """
-    src = BASE / "sources" / "cochilco_override.json"
-    js = load_json_if_exists(src)
-    if not js:
-        return None
-    return {"cobre_usd_lb": js.get("cobre_usd_lb")}
-
-def get_enap_local():
-    """
-    sources/enap_semana.json (fuente semanal manual)
-    {
-      "vigencia": "2025-10-23 a 2025-10-29",
-      "g93_clp_l": 1250,
-      "g95_clp_l": 1285,
-      "g97_clp_l": 1320,
-      "diesel_clp_l": 1090
-    }
-
-    ✅ Cambio pedido: NO devolvemos ni guardamos vigencia/fecha.
-    La razón: evitar que se quede una fecha mala si olvidas actualizarla.
-    """
-    src = BASE / "sources" / "enap_semana.json"
-    js = load_json_if_exists(src)
-    if not js:
-        return {
-            "g93_clp_l": None,
-            "g95_clp_l": None,
-            "g97_clp_l": None,
-            "diesel_clp_l": None,
-        }
-    return {
-        "g93_clp_l": js.get("g93_clp_l"),
-        "g95_clp_l": js.get("g95_clp_l"),
-        "g97_clp_l": js.get("g97_clp_l"),
-        "diesel_clp_l": js.get("diesel_clp_l"),
-    }
-
-# =======================
-# CNE API (Bencina en Línea) — no se usa (dejado por si vuelve)
-# =======================
-def _cne_get(path, params=None):
-    if params is None:
-        params = {}
-    api_key = os.getenv("CNE_API_KEY")
-    if not api_key:
-        raise RuntimeError("Falta CNE_API_KEY en el entorno.")
-    params["apikey"] = api_key  # ajusta si tu key exige otro nombre
-    r = http_get(f"{CNE_BASE}{path}", params=params, headers=HDR, timeout=30, tries=4, backoff=2.0)
-    return r.json()
-
-def get_cne_fuel_averages():
-    """
-    Promedios nacionales CLP/L para 93/95/97/Diésel desde CNE.
-    (No usado actualmente, pero corregido por si se reactiva).
-
-    ✅ Cambio pedido: sin vigencia/fecha.
-    """
-    precios = {"93": [], "95": [], "97": [], "diesel": []}
-
-    page = 1
-    while True:
-        data = _cne_get("/combustibles/estaciones", params={"page": page})
-        estaciones = data.get("data") or data.get("results") or []
-        if not estaciones:
-            break
-
-        for est in estaciones:
-            for p in est.get("precios", []):
-                prod = str(p.get("producto", "")).lower()
-                val = p.get("precio")
-                if not isinstance(val, (int, float)):
-                    continue
-                if prod in ("93", "gasolina 93"):
-                    precios["93"].append(val)
-                elif prod in ("95", "gasolina 95"):
-                    precios["95"].append(val)
-                elif prod in ("97", "gasolina 97"):
-                    precios["97"].append(val)
-                elif "díesel" in prod or "diesel" in prod or prod == "d":
-                    precios["diesel"].append(val)
-
-        next_page = data.get("next") or data.get("pagination", {}).get("next_page")
-        if next_page:
-            page += 1
-        else:
-            break
-
-    promedios = {
-        "g93_clp_l": round(mean(precios["93"])) if precios["93"] else None,
-        "g95_clp_l": round(mean(precios["95"])) if precios["95"] else None,
-        "g97_clp_l": round(mean(precios["97"])) if precios["97"] else None,
-        "diesel_clp_l": round(mean(precios["diesel"])) if precios["diesel"] else None,
-    }
-    return promedios
-
-# =======================
-# Noticias automáticas (RSS) + fallback local
-# =======================
-RSS_FEEDS = [
-    "https://feeds.reuters.com/reuters/ESbusinessNews",
-    "https://feeds.reuters.com/reuters/ESworldNews",
-    "https://news.google.com/rss/search?q=Econom%C3%ADa+Chile&hl=es-419&gl=CL&ceid=CL:es-419",
-    "https://news.google.com/rss/search?q=Mercados+Chile&hl=es-419&gl=CL&ceid=CL:es-419",
-]
-
-def _clean_title(t):
-    if not t:
-        return None
-    t = t.strip()
-    for pref in ("VIDEO:", "Video:", "EN VIVO:", "En vivo:", "FOTO:", "Fotos:"):
-        if t.startswith(pref):
-            t = t[len(pref):].strip()
-    if len(t) > 150:
-        t = t[:147].rstrip() + "…"
-    return t
-
-def _parse_rss(xml_bytes):
-    root = ET.fromstring(xml_bytes)
-
-    # RSS: channel/item/title
-    chan = root.find("channel")
-    if chan is not None:
-        for item in chan.findall("item"):
-            title_el = item.find("title")
-            if title_el is not None and title_el.text:
-                title = _clean_title(title_el.text)
-                if title:
-                    return {"titular": title}
+        return float(x)
+    except Exception:
         return None
 
-    # Atom: feed/entry/title
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
-    for entry in root.findall("atom:entry", ns):
-        title_el = entry.find("atom:title", ns)
-        if title_el is not None and title_el.text:
-            title = _clean_title(title_el.text)
-            if title:
-                return {"titular": title}
-    return None
 
-def get_news_auto():
-    """RSS → si falla, news_override.json → si no, N/D"""
-    for url in RSS_FEEDS:
+def _safe_json_load(path: Path) -> Dict:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _safe_json_write(path: Path, data: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+# =========================
+# Persistencia "best effort"
+# =========================
+def load_last_ok() -> Dict:
+    """
+    Último set de valores "buenos" (para fallback cuando un fetch falla).
+    OJO: en Render sin disco persistente se puede perder tras restart.
+    """
+    return _safe_json_load(LAST_OK_JSON)
+
+
+def save_last_ok(data: Dict) -> None:
+    _safe_json_write(LAST_OK_JSON, data)
+
+
+# =========================
+# Stooq helpers (liviano)
+# =========================
+def _stooq_last_close(symbol: str) -> Optional[float]:
+    """
+    Intenta obtener el último CLOSE desde Stooq.
+    Devuelve float o None.
+    """
+    urls = [
+        f"https://stooq.pl/q/l/?s={symbol}&i=d",
+        f"https://stooq.com/q/l/?s={symbol}&i=d",
+        f"https://stooq.pl/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv",
+        f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv",
+    ]
+
+    for url in urls:
         try:
-            r = http_get(url, headers=HDR, timeout=15, tries=3, backoff=2.0)
-            if r.status_code == 200 and r.content:
-                parsed = _parse_rss(r.content)
-                if parsed and parsed.get("titular"):
-                    return parsed
+            r = _http_get(url, timeout=15)
+            if r.status_code != 200:
+                continue
+            text = (r.text or "").strip()
+            if not text or "No data" in text or "Brak danych" in text:
+                continue
+
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) < 2:
+                continue
+
+            last = lines[-1]
+            cols = [c.strip() for c in last.split(",")]
+            if len(cols) < 5:
+                cols = [c.strip() for c in last.split(";")]
+            if len(cols) < 5:
+                continue
+
+            close_val = _safe_float(cols[4])
+            if close_val is None:
+                continue
+            return close_val
         except Exception:
             continue
 
-    # Fallback local (opcional)
-    src = BASE / "sources" / "news_override.json"
-    js = load_json_if_exists(src)
-    if js and js.get("titular"):
-        return {"titular": js.get("titular")}
+    return None
 
-    return {"titular": None}
 
-# =======================
-# Cache (último JSON bueno)
-# =======================
-def load_last_ok():
-    js = load_json_if_exists(LATEST_JSON)
-    return js or {}
+# =========================
+# Yahoo Chart API fallback (SILENCIOSO + liviano)
+# =========================
+def _yahoo_chart_last_close(ticker: str) -> Optional[float]:
+    """
+    Último cierre usando endpoint público:
+      https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=5d&interval=1d
 
-def save_latest(data: dict):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    LATEST_JSON.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    Ventajas:
+    - No usa yfinance (no prints raros)
+    - Menos dependencia / menos RAM
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"range": "5d", "interval": "1d"}
 
-# =======================
-# Main
-# =======================
-def main():
-    fecha_hoy = fecha_es_hoy()
-    last = load_last_ok()
-
-    # --- Dólar/UF/UTM ---
     try:
-        md = get_mindicador()
-    except Exception as e:
-        print(f"[WARN] mindicador falló: {e}")
-        md = {
-            "dolar_clp": last.get("dolar_clp"),
-            "uf_clp": last.get("uf_clp"),
-            "utm_clp": last.get("utm_clp"),
-        }
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": _UA})
+        if r.status_code != 200:
+            return None
 
-    # --- Crypto ---
-    try:
-        cr = get_crypto()
-    except Exception as e:
-        print(f"[WARN] cripto falló: {e}")
-        cr = {
-            "btc_usd": last.get("btc_usd"),
-            "eth_usd": last.get("eth_usd"),
-        }
+        j = r.json()
+        chart = (j or {}).get("chart") or {}
+        error = chart.get("error")
+        if error:
+            return None
 
-    # --- Brent ---
-    br = get_brent()
-    if br.get("brent_usd") is None and last.get("brent_usd") is not None:
-        br["brent_usd"] = last.get("brent_usd")
+        results = chart.get("result") or []
+        if not results:
+            return None
 
-    # --- Cobre: override local si existe; si no, COMEX ---
-    cobre_of = get_cobre_oficial_local()
-    if cobre_of and cobre_of.get("cobre_usd_lb"):
-        cb = cobre_of
-    else:
-        cb = get_cobre_comex()
-        if cb.get("cobre_usd_lb") is None and last.get("cobre_usd_lb") is not None:
-            cb["cobre_usd_lb"] = last.get("cobre_usd_lb")
+        result0 = results[0] or {}
+        indicators = (result0.get("indicators") or {})
+        quote = (indicators.get("quote") or [])
+        if not quote:
+            return None
 
-    # --- Combustibles (forzado a JSON local semanal) ---
-    combustibles = get_enap_local()
-    for k in ("g93_clp_l", "g95_clp_l", "g97_clp_l", "diesel_clp_l"):
-        if combustibles.get(k) is None and last.get(k) is not None:
-            combustibles[k] = last.get(k)
+        closes = (quote[0] or {}).get("close") or []
+        # toma último close no-nulo desde el final
+        for x in reversed(closes):
+            v = _safe_float(x)
+            if v is not None:
+                return float(v)
 
-    # --- Noticia automática ---
-    news = get_news_auto()
+        return None
+    except Exception:
+        return None
 
-    # --- Ensamble datos finales ---
-    data = {
-        **({} if md is None else md),
-        **({} if cr is None else cr),
-        **({} if br is None else br),
-        **({} if cb is None else cb),
-        **({} if combustibles is None else combustibles),
+
+# =========================
+# Fuentes principales (Chile + mercados)
+# =========================
+def get_mindicador() -> Dict:
+    """
+    mindicador.cl (UF, dólar, UTM)
+    """
+    url = "https://mindicador.cl/api"
+    r = _http_get(url, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+
+    dolar = _safe_float((j.get("dolar") or {}).get("valor"))
+    uf = _safe_float((j.get("uf") or {}).get("valor"))
+    utm = _safe_float((j.get("utm") or {}).get("valor"))
+
+    return {"dolar_clp": dolar, "uf_clp": uf, "utm_clp": utm}
+
+
+def get_crypto() -> Dict:
+    """
+    Coingecko simple price
+    """
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        "?ids=bitcoin,ethereum&vs_currencies=usd"
+    )
+    r = _http_get(url, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    btc = _safe_float((j.get("bitcoin") or {}).get("usd"))
+    eth = _safe_float((j.get("ethereum") or {}).get("usd"))
+    return {"btc_usd": btc, "eth_usd": eth}
+
+
+def get_enap_local() -> Dict:
+    """
+    Lee sources/enap_semana.json (editable por tu panel).
+    """
+    d = _safe_json_load(ENAP_FILE)
+    out = {
+        "vigencia": (d.get("vigencia") or "").strip(),
+        "g93_clp_l": d.get("g93_clp_l"),
+        "g95_clp_l": d.get("g95_clp_l"),
+        "g97_clp_l": d.get("g97_clp_l"),
+        "diesel_clp_l": d.get("diesel_clp_l"),
     }
+    return out
 
-    # Guarda cache para el render
-    save_latest(data)
 
-    # --- Salida por consola (prolija) ---
-    print(f"\nFINANZAS HOY CHILE — {fecha_hoy}")
+def get_cobre_oficial_local() -> Optional[Dict]:
+    """
+    (Opcional) si tienes una fuente oficial/propia cacheada en sources/cobre_oficial.json:
+      {"cobre_usd_lb": 5.57, "source": "...", "ts": "..."}
+    """
+    d = _safe_json_load(COBRE_OFICIAL_FILE)
+    if not d:
+        return None
+    val = _safe_float(d.get("cobre_usd_lb"))
+    if val is None:
+        return None
+    return {"cobre_usd_lb": val}
+
+
+def get_cobre_comex() -> Dict:
+    """
+    Cobre COMEX aprox (USD/lb).
+
+    Prioridad:
+      1) Stooq HG.F (a veces viene en centavos/lb -> convertimos)
+      2) Yahoo Chart HG=F (fallback)
+    """
+    # 1) Stooq
+    close = _stooq_last_close("hg.f")
+    if close is not None:
+        cobre = close / 100.0 if close > 50 else close
+        return {"cobre_usd_lb": float(cobre)}
+
+    # 2) Yahoo chart fallback (silencioso)
+    yf_close = _yahoo_chart_last_close("HG=F")
+    if yf_close is not None:
+        return {"cobre_usd_lb": float(yf_close)}
+
+    return {"cobre_usd_lb": None}
+
+
+def get_brent() -> Dict:
+    """
+    Brent (USD/bbl).
+
+    Prioridad:
+      1) Stooq CB.F
+      2) Yahoo Chart BZ=F (fallback)
+    """
+    # 1) Stooq
+    close = _stooq_last_close("cb.f")
+    if close is not None:
+        return {"brent_usd": float(close)}
+
+    # 2) Yahoo chart fallback (silencioso)
+    yf_close = _yahoo_chart_last_close("BZ=F")
+    if yf_close is not None:
+        return {"brent_usd": float(yf_close)}
+
+    return {"brent_usd": None}
+
+
+# =========================
+# Consola (debug)
+# =========================
+def _fmt_clp(x: Optional[float]) -> str:
+    if x is None:
+        return "N/D"
+    return f"$ {x:,.0f}".replace(",", ".")
+
+
+def _fmt_usd(x: Optional[float]) -> str:
+    if x is None:
+        return "N/D"
+    return f"${x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _fmt_num(x: Optional[float], nd: str = "N/D") -> str:
+    if x is None:
+        return nd
+    return f"{x:.2f}"
+
+
+def main():
+    """
+    Imprime un resumen estilo consola.
+    Nota: el pipeline real usa fetch_to_json.py, render_panel.py, etc.
+    """
+    d = _safe_json_load(LATEST_JSON) if LATEST_JSON.exists() else {}
+    if not d:
+        last = load_last_ok()
+        try:
+            md = get_mindicador()
+        except Exception:
+            md = {}
+        try:
+            cr = get_crypto()
+        except Exception:
+            cr = {}
+        br = get_brent()
+        cb = get_cobre_comex()
+        en = get_enap_local()
+        d = {**last, **md, **cr, **br, **cb, **en}
+
+    today = dt.datetime.now()
+    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    dia = dias[today.weekday()]
+
+    print(f"\nFINANZAS HOY CHILE — {dia} {today.strftime('%d/%m/%Y')}")
     print("-" * 64)
-    print(f"Dólar (CLP):       {fmt_clp(data.get('dolar_clp'))}")
-    print(f"UF (CLP):          {fmt_clp(data.get('uf_clp'))}")
-    print(f"UTM (CLP):         {fmt_clp(data.get('utm_clp'))}")
-    print(f"Cobre (USD/lb):    {fmt_float(data.get('cobre_usd_lb'), 2)}")
-    print(f"Brent (USD/bbl):   {fmt_usd(data.get('brent_usd'), 0)}")
+    print(f"Dólar (CLP):       {_fmt_clp(_safe_float(d.get('dolar_clp')))}")
+    print(f"UF (CLP):          {_fmt_clp(_safe_float(d.get('uf_clp')))}")
+    print(f"UTM (CLP):         {_fmt_clp(_safe_float(d.get('utm_clp')))}")
+    print(f"Cobre (USD/lb):    {_fmt_num(_safe_float(d.get('cobre_usd_lb')))}")
+    print(f"Brent (USD/bbl):   {_fmt_usd(_safe_float(d.get('brent_usd')))}")
     print("-" * 64)
     print("Combustibles (CLP/L) — Precios a público:")
-    print(f"  93:    {fmt_clp(data.get('g93_clp_l'))}")
-    print(f"  95:    {fmt_clp(data.get('g95_clp_l'))}")
-    print(f"  97:    {fmt_clp(data.get('g97_clp_l'))}")
-    print(f"  Diésel:{fmt_clp(data.get('diesel_clp_l'))}")
+    print(f"  93:    {_fmt_clp(_safe_float(d.get('g93_clp_l')))}")
+    print(f"  95:    {_fmt_clp(_safe_float(d.get('g95_clp_l')))}")
+    print(f"  97:    {_fmt_clp(_safe_float(d.get('g97_clp_l')))}")
+    print(f"  Diésel:{_fmt_clp(_safe_float(d.get('diesel_clp_l')))}")
     print("-" * 64)
-    print(f"BTC (USD):         {fmt_usd(data.get('btc_usd'), 0)}")
-    print(f"ETH (USD):         {fmt_usd(data.get('eth_usd'), 0)}")
+    # (mantengo tu formato; si quieres lo dejamos más limpio después)
+    print(f"BTC (USD):         {_fmt_clp(_safe_float(d.get('btc_usd'))).replace('$','$',1)}")
+    print(f"ETH (USD):         {_fmt_clp(_safe_float(d.get('eth_usd'))).replace('$','$',1)}")
     print("-" * 64)
-    print("Noticia del día:", (news.get("titular") or "N/D"))
+
 
 if __name__ == "__main__":
+    # baja el ruido de logs globales si alguna lib insiste
+    logging.getLogger().setLevel(logging.ERROR)
     main()

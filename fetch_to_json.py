@@ -6,6 +6,7 @@ from fetch_finanzas_cl import (get_brent, get_cobre_comex,
                                get_cobre_oficial_local, get_crypto,
                                get_enap_local, get_mindicador, load_last_ok)
 from fetch_finanzas_cl import main as run_console
+from fetch_finanzas_cl import save_last_ok
 
 
 def collect():
@@ -30,29 +31,40 @@ def collect():
             "eth_usd": last.get("eth_usd"),
         }
 
-    # --- Brent ---
-    br = get_brent()
+    # --- Brent (robusto: Stooq -> yfinance -> last_ok) ---
+    try:
+        br = get_brent()
+    except Exception:
+        br = {"brent_usd": None}
+
     if br.get("brent_usd") is None and last.get("brent_usd") is not None:
         br["brent_usd"] = last.get("brent_usd")
 
-    # --- Cobre ---
-    cobre_of = get_cobre_oficial_local()
-    if cobre_of and cobre_of.get("cobre_usd_lb"):
-        cb = cobre_of
-    else:
-        cb = get_cobre_comex()
-        if cb.get("cobre_usd_lb") is None and last.get("cobre_usd_lb") is not None:
-            cb["cobre_usd_lb"] = last.get("cobre_usd_lb")
+    # --- Cobre (robusto: local_oficial -> Stooq/yfinance -> last_ok) ---
+    cb = None
+    try:
+        cobre_of = get_cobre_oficial_local()
+        if cobre_of and cobre_of.get("cobre_usd_lb") is not None:
+            cb = cobre_of
+    except Exception:
+        cb = None
 
-    # --- Combustibles (forzado a JSON local semanal) ---
-    combustibles = get_enap_local()
+    if not cb:
+        try:
+            cb = get_cobre_comex()
+        except Exception:
+            cb = {"cobre_usd_lb": None}
 
-    # ✅ Cambio: quitamos "vigencia_semana" para eliminar fechas/rangos de combustibles
+    if cb.get("cobre_usd_lb") is None and last.get("cobre_usd_lb") is not None:
+        cb["cobre_usd_lb"] = last.get("cobre_usd_lb")
+
+    # --- Combustibles (local semanal) ---
+    combustibles = get_enap_local() or {}
     for k in ("g93_clp_l", "g95_clp_l", "g97_clp_l", "diesel_clp_l"):
         if combustibles.get(k) is None and last.get(k) is not None:
             combustibles[k] = last.get(k)
 
-    # Por seguridad: si por cualquier razón viene en el dict, lo removemos igual
+    # Si por cualquier razón viene, lo removemos (no lo usamos)
     if isinstance(combustibles, dict):
         combustibles.pop("vigencia_semana", None)
 
@@ -63,17 +75,41 @@ def collect():
         **(cb or {}),
         **(combustibles or {}),
     }
+
+    today = dt.date.today().isoformat()
+    data["fecha"] = today
     data["generated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     return data
 
 
+def _should_save_last_ok(d: dict) -> bool:
+    """
+    Evita guardar 'last_ok' si faltan campos críticos (para no “pisar” un last_ok bueno con N/D).
+    """
+    critical = ("dolar_clp", "uf_clp", "cobre_usd_lb", "brent_usd")
+    for k in critical:
+        if d.get(k) is None:
+            return False
+    return True
+
+
 if __name__ == "__main__":
     data = collect()
+
     outdir = Path("data")
     outdir.mkdir(exist_ok=True)
+
     (outdir / "latest.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    # Imprime como consola (no intenta CNE)
+
+    # Guarda last_ok SOLO si viene completo (para no degradar por un fetch malo)
+    if _should_save_last_ok(data):
+        save_last_ok(data)
+
+    # Imprime como consola (debug)
     run_console()
+
+    # Imprime JSON final en 1 línea (para tus greps)
+    print(json.dumps(data, ensure_ascii=False))
