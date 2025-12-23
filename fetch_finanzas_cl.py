@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#fetch_finanzas_cl.py
+
 
 """
 fetch_finanzas_cl.py

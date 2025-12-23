@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#upload_to_youtube.py
+
 
 import base64
 import datetime as dt

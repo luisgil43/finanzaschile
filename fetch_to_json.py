@@ -31,7 +31,7 @@ def collect():
             "eth_usd": last.get("eth_usd"),
         }
 
-    # --- Brent (robusto: Stooq -> yfinance -> last_ok) ---
+    # --- Brent ---
     try:
         br = get_brent()
     except Exception:
@@ -40,7 +40,7 @@ def collect():
     if br.get("brent_usd") is None and last.get("brent_usd") is not None:
         br["brent_usd"] = last.get("brent_usd")
 
-    # --- Cobre (robusto: local_oficial -> Stooq/yfinance -> last_ok) ---
+    # --- Cobre ---
     cb = None
     try:
         cobre_of = get_cobre_oficial_local()
@@ -64,7 +64,6 @@ def collect():
         if combustibles.get(k) is None and last.get(k) is not None:
             combustibles[k] = last.get(k)
 
-    # Si por cualquier razón viene, lo removemos (no lo usamos)
     if isinstance(combustibles, dict):
         combustibles.pop("vigencia_semana", None)
 
@@ -76,21 +75,15 @@ def collect():
         **(combustibles or {}),
     }
 
-    today = dt.date.today().isoformat()
-    data["fecha"] = today
+    # ✅ DD-MM-YYYY
+    data["fecha"] = dt.datetime.now().strftime("%d-%m-%Y")
     data["generated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     return data
 
 
 def _should_save_last_ok(d: dict) -> bool:
-    """
-    Evita guardar 'last_ok' si faltan campos críticos (para no “pisar” un last_ok bueno con N/D).
-    """
     critical = ("dolar_clp", "uf_clp", "cobre_usd_lb", "brent_usd")
-    for k in critical:
-        if d.get(k) is None:
-            return False
-    return True
+    return all(d.get(k) is not None for k in critical)
 
 
 if __name__ == "__main__":
@@ -98,18 +91,13 @@ if __name__ == "__main__":
 
     outdir = Path("data")
     outdir.mkdir(exist_ok=True)
-
     (outdir / "latest.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    # Guarda last_ok SOLO si viene completo (para no degradar por un fetch malo)
     if _should_save_last_ok(data):
         save_last_ok(data)
 
-    # Imprime como consola (debug)
     run_console()
-
-    # Imprime JSON final en 1 línea (para tus greps)
     print(json.dumps(data, ensure_ascii=False))
