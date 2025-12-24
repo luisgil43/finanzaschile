@@ -1,4 +1,4 @@
-#server.py
+# server.py
 
 import datetime as dt
 import fcntl
@@ -36,6 +36,11 @@ RUN_TOKEN = os.getenv("RUN_TOKEN", "").strip()
 TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
 
 RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
+
+# ✅ NUEVO: slots dentro de la hora (por defecto 0 y 30)
+# 07:00 => short, 07:30 => normal
+RUN_MINUTES = os.getenv("RUN_MINUTES", "0,30").strip()
+
 RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
 ALLOW_FORCE = os.getenv("ALLOW_FORCE", "1") == "1"
 
@@ -46,7 +51,7 @@ LOG_FILE = RUNTIME_DIR / "last_run.log"
 
 # Limita crecimiento del log para NO reventar RAM (admin tail)
 MAX_LOG_BYTES = int(os.getenv("MAX_LOG_BYTES", "1000000"))  # 1MB default
-TAIL_BYTES = int(os.getenv("TAIL_BYTES", "250000"))         # 250KB default
+TAIL_BYTES = int(os.getenv("TAIL_BYTES", "250000"))  # 250KB default
 
 BASE_DIR = Path(__file__).resolve().parent
 ENAP_FILE = BASE_DIR / "sources" / "enap_semana.json"
@@ -76,12 +81,14 @@ def login_required(fn):
         if not session.get("logged_in"):
             return redirect(url_for("login", next=request.path))
         return fn(*args, **kwargs)
+
     return wrapper
 
 
 def _tz_now() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo  # py3.9+
+
         return dt.datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
         return dt.datetime.now()
@@ -120,14 +127,12 @@ def _truncate_log_if_needed() -> None:
         # corta a líneas completas
         text = chunk.decode("utf-8", errors="ignore")
         lines = text.splitlines()
-        # si quedó muy corto, igual sirve
         out = "\n".join(lines[-2000:]) + "\n"
 
         tmp = LOG_FILE.with_suffix(".tmp")
         tmp.write_text(out, encoding="utf-8")
         tmp.replace(LOG_FILE)
     except Exception:
-        # si falla, no rompas el pipeline
         return
 
 
@@ -210,22 +215,78 @@ def _acquire_lock_nonblocking():
         return None
 
 
+# =========================
+# Schedule slots (07:00 / 07:30)
+# =========================
+def _parse_run_minutes() -> List[int]:
+    out: List[int] = []
+    for part in (RUN_MINUTES or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            m = int(part)
+            if 0 <= m <= 59:
+                out.append(m)
+        except Exception:
+            pass
+    out = sorted(set(out))
+    return out or [0]
+
+
+def _match_slot(now: dt.datetime) -> Optional[int]:
+    """
+    Si now cae dentro de la ventana de algún slot (RUN_MINUTES),
+    devuelve el minuto del slot. Si no, None.
+    """
+    if now.hour != RUN_HOUR:
+        return None
+
+    win = max(1, RUN_WINDOW_MINUTES)
+    for m in _parse_run_minutes():
+        if m <= now.minute < (m + win):
+            return m
+    return None
+
+
 def _within_run_window(now: dt.datetime) -> bool:
     is_weekday = now.weekday() <= 4  # lun-vie
     if not is_weekday:
         return False
-    if now.hour != RUN_HOUR:
-        return False
-    return 0 <= now.minute < max(1, RUN_WINDOW_MINUTES)
+    return _match_slot(now) is not None
+
+
+def _slot_profile(slot_minute: int) -> str:
+    # 0 => short, 30 => normal (y cualquier otro que definas lo puedes mapear aquí)
+    if slot_minute == 0:
+        return "short"
+    if slot_minute == 30:
+        return "normal"
+    # default: short (seguro para RAM)
+    return "short"
 
 
 def _should_run(now: dt.datetime, state: Dict) -> Tuple[bool, str]:
-    if not _within_run_window(now):
+    """
+    Evita doble corrida del mismo slot.
+    Guarda y usa un run_key: YYYY-MM-DD@07:00 o YYYY-MM-DD@07:30
+    """
+    slot = _match_slot(now)
+    if slot is None:
         return False, "outside_schedule"
-    today = now.date().isoformat()
-    last_ok = (state.get("last_success_date") or "").strip()
-    if last_ok == today:
-        return False, "already_ran_today"
+
+    today_iso = now.date().isoformat()
+    run_key = f"{today_iso}@{RUN_HOUR:02d}:{slot:02d}"
+
+    last_key = (state.get("last_success_run_key") or "").strip()
+    if last_key == run_key:
+        return False, "already_ran_this_slot"
+
+    # guarda el slot “pendiente” para que el job sepa qué perfil correr
+    state["_pending_slot"] = int(slot)
+    state["_pending_run_key"] = run_key
+    _write_state(state)
+
     return True, "ok_to_run"
 
 
@@ -262,18 +323,37 @@ def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
     return results
 
 
-def _run_pipeline_job(started_by: str, forced: bool):
+def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[str] = None):
     now = _tz_now()
     state = _read_state()
+
+    # Decide perfil:
+    # - si viene forced_profile => úsalo (pruebas)
+    # - si no, usa slot agendado (_pending_slot)
+    slot = state.get("_pending_slot")
+    profile = None
+    if forced_profile in ("short", "normal"):
+        profile = forced_profile
+    else:
+        try:
+            slot_int = int(slot) if slot is not None else 0
+        except Exception:
+            slot_int = 0
+        profile = _slot_profile(slot_int)
+
+    run_key = (state.get("_pending_run_key") or "").strip() or f"{now.date().isoformat()}@{RUN_HOUR:02d}:{int(slot or 0):02d}"
 
     state["last_started_at"] = now.isoformat(timespec="seconds")
     state["last_started_by"] = started_by
     state["last_forced"] = bool(forced)
     state["last_status"] = "running"
     state["last_error_step"] = None
+    state["last_profile"] = profile
     _write_state(state)
 
-    _append_log(f"\n=== START {state['last_started_at']} by={started_by} forced={forced} short_only={SHORT_ONLY} ===")
+    _append_log(
+        f"\n=== START {state['last_started_at']} by={started_by} forced={forced} profile={profile} run_key={run_key} ==="
+    )
 
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
@@ -288,14 +368,29 @@ def _run_pipeline_job(started_by: str, forced: bool):
         for name, cmd in _pipeline_steps():
             _append_log(f"[STEP] {name}: {' '.join(cmd)}")
 
-            # En Render por defecto solo short (reduce RAM)
+            # --- Perfil por corrida ---
             extra_env: Dict[str, str] = {}
-            if SHORT_ONLY and name == "make_video":
-                extra_env.setdefault("GENERATE_FULL_VIDEO", "0")
-                extra_env.setdefault("GENERATE_SHORT_VIDEO", "1")
-            if SHORT_ONLY and name == "upload":
-                extra_env.setdefault("UPLOAD_NORMAL", "0")
-                extra_env.setdefault("UPLOAD_SHORT", "1")
+
+            # Mantengo SHORT_ONLY como “seguro global” (por si lo usas en dev),
+            # pero el perfil manda.
+            if profile == "short":
+                if name == "make_video":
+                    extra_env.setdefault("GENERATE_FULL_VIDEO", "0")
+                    extra_env.setdefault("GENERATE_SHORT_VIDEO", "1")
+                if name == "upload":
+                    extra_env.setdefault("UPLOAD_NORMAL", "0")
+                    extra_env.setdefault("UPLOAD_SHORT", "1")
+
+            elif profile == "normal":
+                if name == "make_video":
+                    extra_env.setdefault("GENERATE_FULL_VIDEO", "1")
+                    extra_env.setdefault("GENERATE_SHORT_VIDEO", "0")
+                if name == "upload":
+                    extra_env.setdefault("UPLOAD_NORMAL", "1")
+                    extra_env.setdefault("UPLOAD_SHORT", "0")
+
+            # compat: si alguien dejó SHORT_ONLY=1, NO queremos romper:
+            # profile ya define todo; SHORT_ONLY no se aplica aquí.
 
             code, out, err = _run(cmd, extra_env=extra_env if extra_env else None)
 
@@ -323,7 +418,11 @@ def _run_pipeline_job(started_by: str, forced: bool):
         st = _read_state()
         st["last_status"] = "success"
         st["last_finished_at"] = finished.isoformat(timespec="seconds")
-        st["last_success_date"] = finished.date().isoformat()
+        st["last_success_date"] = finished.strftime("%d-%m-%Y")  # ✅ tu formato
+        st["last_success_run_key"] = run_key  # ✅ evita repetir este slot
+        # limpia pending
+        st.pop("_pending_slot", None)
+        st.pop("_pending_run_key", None)
         _write_state(st)
         _append_log(f"=== SUCCESS {st['last_finished_at']} ===")
 
@@ -338,14 +437,14 @@ def _run_pipeline_job(started_by: str, forced: bool):
             pass
 
 
-def _start_background_job(started_by: str, forced: bool) -> bool:
+def _start_background_job(started_by: str, forced: bool, forced_profile: Optional[str] = None) -> bool:
     global _background_thread
     with _thread_guard:
         if _background_thread and _background_thread.is_alive():
             return False
         _background_thread = threading.Thread(
             target=_run_pipeline_job,
-            args=(started_by, forced),
+            args=(started_by, forced, forced_profile),
             daemon=True,
         )
         _background_thread.start()
@@ -404,6 +503,7 @@ def status():
             "ok": True,
             "tz": TZ_NAME,
             "run_hour": RUN_HOUR,
+            "run_minutes": _parse_run_minutes(),
             "run_window_minutes": RUN_WINDOW_MINUTES,
             "short_only": SHORT_ONLY,
             "state": state,
@@ -423,12 +523,26 @@ def run_daily():
 
     forced = (request.args.get("force") == "1") and ALLOW_FORCE
 
+    # ✅ NUEVO (solo para pruebas): force + slot=short|normal
+    forced_profile = (request.args.get("slot") or "").strip().lower()
+    if forced_profile not in ("short", "normal"):
+        forced_profile = None
+
     if forced:
-        started = _start_background_job(started_by="force", forced=True)
-        return jsonify({"ok": True, "forced": True, "started": started, "now": now.isoformat(timespec="seconds")})
+        started = _start_background_job(started_by="force", forced=True, forced_profile=forced_profile)
+        return jsonify(
+            {
+                "ok": True,
+                "forced": True,
+                "started": started,
+                "now": now.isoformat(timespec="seconds"),
+                "profile": forced_profile or "auto",
+            }
+        )
 
     should, reason = _should_run(now, state)
     if not should:
+        slot = _match_slot(now)
         return jsonify(
             {
                 "ok": True,
@@ -438,12 +552,22 @@ def run_daily():
                 "weekday": now.weekday(),
                 "hour": now.hour,
                 "minute": now.minute,
+                "slot": slot,
+                "profile": _slot_profile(int(slot)) if slot is not None else None,
                 "last_success_date": state.get("last_success_date"),
+                "last_success_run_key": state.get("last_success_run_key"),
             }
         )
 
-    started = _start_background_job(started_by="schedule", forced=False)
-    return jsonify({"ok": True, "started": started, "reason": "started" if started else "already_running_in_process", "now": now.isoformat(timespec="seconds")})
+    started = _start_background_job(started_by="schedule", forced=False, forced_profile=None)
+    return jsonify(
+        {
+            "ok": True,
+            "started": started,
+            "reason": "started" if started else "already_running_in_process",
+            "now": now.isoformat(timespec="seconds"),
+        }
+    )
 
 
 # =========================
@@ -552,11 +676,14 @@ ADMIN_HTML = """
           <div class="pill"><span class="k">started:</span> {{ state.get('last_started_at') }}</div>
           <div class="pill"><span class="k">finished:</span> {{ state.get('last_finished_at') }}</div>
           <div class="pill"><span class="k">last_success_date:</span> {{ state.get('last_success_date') }}</div>
+          <div class="pill"><span class="k">run_key:</span> {{ state.get('last_success_run_key') }}</div>
+          <div class="pill"><span class="k">profile:</span> {{ state.get('last_profile') }}</div>
           <div class="pill"><span class="k">error_step:</span> {{ state.get('last_error_step') }}</div>
           <div class="pill"><span class="k">short_only:</span> {{ short_only }}</div>
         </div>
         <div style="margin-top:10px">
-          <a class="btn" href="/run?token={{ run_token }}&force=1" target="_blank">▶️ Forzar run ahora</a>
+          <a class="btn" href="/run?token={{ run_token }}&force=1&slot=short" target="_blank">▶️ Probar SHORT</a>
+          <a class="btn" href="/run?token={{ run_token }}&force=1&slot=normal" target="_blank" style="margin-left:8px">▶️ Probar VIDEO</a>
           <span class="muted" style="margin-left:10px">*usa tu RUN_TOKEN</span>
         </div>
       </div>
