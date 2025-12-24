@@ -15,34 +15,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     tar \
+    libstdc++6 \
+    libgomp1 \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # ----------------------------
-# Piper (neural TTS) + voice model
+# Piper (neural TTS) + voice model (España)
 # ----------------------------
 ARG PIPER_VERSION=1.2.0
 ENV PIPER_HOME=/opt/piper
 ENV PATH="/opt/piper:${PATH}"
 
-# Usamos Piper por defecto en Render (puedes apagar con USE_PIPER=0)
+# Usamos Piper por defecto
 ENV USE_PIPER=1
 
-# Modelo/Config por defecto (voz más natural que espeak)
-ENV PIPER_MODEL=/app/voices/es_AR-daniela-high.onnx
-ENV PIPER_CONFIG=/app/voices/es_AR-daniela-high.onnx.json
+# Voz España (puedes cambiar por otra si quieres)
+ENV PIPER_MODEL=/app/voices/es_ES-sharvard-medium.onnx
+ENV PIPER_CONFIG=/app/voices/es_ES-sharvard-medium.onnx.json
 
-RUN mkdir -p "${PIPER_HOME}" \
- && curl -L --fail "https://github.com/rhasspy/piper/releases/download/v${PIPER_VERSION}/piper_amd64.tar.gz" -o /tmp/piper.tar.gz \
- && tar -xzf /tmp/piper.tar.gz -C "${PIPER_HOME}" \
- && rm -f /tmp/piper.tar.gz \
- && chmod +x "${PIPER_HOME}/piper"
+RUN set -eux; \
+  mkdir -p "${PIPER_HOME}"; \
+  ARCH="$(dpkg --print-architecture)"; \
+  case "$ARCH" in \
+    amd64)  PARCH="amd64" ;; \
+    arm64)  PARCH="aarch64" ;; \
+    *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
+  esac; \
+  echo "Downloading Piper for arch=$ARCH (package=$PARCH)"; \
+  curl -L --fail "https://github.com/rhasspy/piper/releases/download/v${PIPER_VERSION}/piper_${PARCH}.tar.gz" -o /tmp/piper.tar.gz; \
+  tar -xzf /tmp/piper.tar.gz -C "${PIPER_HOME}"; \
+  rm -f /tmp/piper.tar.gz; \
+  chmod +x "${PIPER_HOME}/piper"
 
 # Descarga del modelo (HuggingFace)
-RUN mkdir -p /app/voices \
- && curl -L --fail "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_AR/daniela/high/es_AR-daniela-high.onnx" -o "/app/voices/es_AR-daniela-high.onnx" \
- && curl -L --fail "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_AR/daniela/high/es_AR-daniela-high.onnx.json" -o "/app/voices/es_AR-daniela-high.onnx.json"
+RUN set -eux; \
+  mkdir -p /app/voices; \
+  curl -L --fail "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx?download=true" \
+    -o "/app/voices/es_ES-sharvard-medium.onnx"; \
+  curl -L --fail "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx.json?download=true" \
+    -o "/app/voices/es_ES-sharvard-medium.onnx.json"
 
 # ----------------------------
 # Python deps
