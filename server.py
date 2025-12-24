@@ -1,5 +1,3 @@
-# server.py
-
 import datetime as dt
 import fcntl
 import json
@@ -37,8 +35,7 @@ TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
 
 RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
 
-# ✅ NUEVO: slots dentro de la hora (por defecto 0 y 30)
-# 07:00 => short, 07:30 => normal
+# ✅ slots dentro de la hora (por defecto 0 y 30)
 RUN_MINUTES = os.getenv("RUN_MINUTES", "0,30").strip()
 
 RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
@@ -59,6 +56,9 @@ LATEST_JSON = BASE_DIR / "data" / "latest.json"
 
 IS_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
 SHORT_ONLY = os.getenv("SHORT_ONLY", "1" if IS_RENDER else "0") == "1"
+
+# ✅ Nuevo: duplicar el stream del pipeline a logs de Render (stdout)
+LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1" if IS_RENDER else "0") == "1"
 
 _thread_guard = threading.Lock()
 _background_thread = None
@@ -88,7 +88,6 @@ def login_required(fn):
 def _tz_now() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-
         return dt.datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
         return dt.datetime.now()
@@ -175,8 +174,11 @@ def _read_latest_json() -> Dict:
         return {}
 
 
-# ✅ FIX MEMORIA: NO capture_output gigante
 def _run(cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
+    """
+    Ejecuta cmd y streamea salida línea-a-línea al LOG_FILE.
+    Si LOG_TO_STDOUT=1, duplica también a stdout (Render Logs).
+    """
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
@@ -195,10 +197,19 @@ def _run(cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> Tuple[in
     if p.stdout:
         for line in p.stdout:
             s = (line or "").rstrip()
-            if s:
-                _append_log(s)
-                if s.startswith("UPLOAD_RESULT "):
-                    upload_lines.append(s)
+            if not s:
+                continue
+
+            _append_log(s)
+
+            if LOG_TO_STDOUT:
+                # ✅ esto hace que Render muestre el proceso en tiempo real
+                print(s, flush=True)
+
+            if s.startswith("UPLOAD_RESULT "):
+                upload_lines.append(s)
+            if s.startswith("UPLOAD_SKIPPED "):
+                upload_lines.append(s)
 
     code = p.wait()
     return code, "\n".join(upload_lines), ""
@@ -257,12 +268,11 @@ def _within_run_window(now: dt.datetime) -> bool:
 
 
 def _slot_profile(slot_minute: int) -> str:
-    # 0 => short, 30 => normal (y cualquier otro que definas lo puedes mapear aquí)
+    # 0 => short, 30 => normal
     if slot_minute == 0:
         return "short"
     if slot_minute == 30:
         return "normal"
-    # default: short (seguro para RAM)
     return "short"
 
 
@@ -282,7 +292,6 @@ def _should_run(now: dt.datetime, state: Dict) -> Tuple[bool, str]:
     if last_key == run_key:
         return False, "already_ran_this_slot"
 
-    # guarda el slot “pendiente” para que el job sepa qué perfil correr
     state["_pending_slot"] = int(slot)
     state["_pending_run_key"] = run_key
     _write_state(state)
@@ -305,21 +314,25 @@ def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
     text = (stdout or "") + "\n" + (stderr or "")
     for line in text.splitlines():
         line = line.strip()
-        if not line.startswith("UPLOAD_RESULT "):
+        if not (line.startswith("UPLOAD_RESULT ") or line.startswith("UPLOAD_SKIPPED ")):
             continue
-        payload = line[len("UPLOAD_RESULT ") :].strip()
+
+        kind_tag = "UPLOAD_RESULT " if line.startswith("UPLOAD_RESULT ") else "UPLOAD_SKIPPED "
+        payload = line[len(kind_tag):].strip()
+
         parts = payload.split()
-        d = {}
+        d = {"event": "result" if kind_tag == "UPLOAD_RESULT " else "skipped"}
         for p in parts:
             if "=" not in p:
                 continue
             k, v = p.split("=", 1)
             d[k.strip()] = v.strip()
+
         if d.get("id"):
             vid = d["id"]
             d["url_watch"] = f"https://www.youtube.com/watch?v={vid}"
             d["url_shorts"] = f"https://www.youtube.com/shorts/{vid}"
-            results.append(d)
+        results.append(d)
     return results
 
 
@@ -328,10 +341,7 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
     state = _read_state()
 
     # Decide perfil:
-    # - si viene forced_profile => úsalo (pruebas)
-    # - si no, usa slot agendado (_pending_slot)
     slot = state.get("_pending_slot")
-    profile = None
     if forced_profile in ("short", "normal"):
         profile = forced_profile
     else:
@@ -354,10 +364,14 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
     _append_log(
         f"\n=== START {state['last_started_at']} by={started_by} forced={forced} profile={profile} run_key={run_key} ==="
     )
+    if LOG_TO_STDOUT:
+        print(f"=== START {state['last_started_at']} by={started_by} forced={forced} profile={profile} run_key={run_key} ===", flush=True)
 
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
         _append_log("LOCK: already running, exiting.")
+        if LOG_TO_STDOUT:
+            print("LOCK: already running, exiting.", flush=True)
         st = _read_state()
         st["last_status"] = "skipped_already_running"
         st["last_finished_at"] = _tz_now().isoformat(timespec="seconds")
@@ -367,12 +381,11 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
     try:
         for name, cmd in _pipeline_steps():
             _append_log(f"[STEP] {name}: {' '.join(cmd)}")
+            if LOG_TO_STDOUT:
+                print(f"[STEP] {name}: {' '.join(cmd)}", flush=True)
 
-            # --- Perfil por corrida ---
             extra_env: Dict[str, str] = {}
 
-            # Mantengo SHORT_ONLY como “seguro global” (por si lo usas en dev),
-            # pero el perfil manda.
             if profile == "short":
                 if name == "make_video":
                     extra_env.setdefault("GENERATE_FULL_VIDEO", "0")
@@ -388,9 +401,6 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
                 if name == "upload":
                     extra_env.setdefault("UPLOAD_NORMAL", "1")
                     extra_env.setdefault("UPLOAD_SHORT", "0")
-
-            # compat: si alguien dejó SHORT_ONLY=1, NO queremos romper:
-            # profile ya define todo; SHORT_ONLY no se aplica aquí.
 
             code, out, err = _run(cmd, extra_env=extra_env if extra_env else None)
 
@@ -412,19 +422,22 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
                 st["last_finished_at"] = _tz_now().isoformat(timespec="seconds")
                 _write_state(st)
                 _append_log(f"=== FAIL step={name} code={code} ===")
+                if LOG_TO_STDOUT:
+                    print(f"=== FAIL step={name} code={code} ===", flush=True)
                 return
 
         finished = _tz_now()
         st = _read_state()
         st["last_status"] = "success"
         st["last_finished_at"] = finished.isoformat(timespec="seconds")
-        st["last_success_date"] = finished.strftime("%d-%m-%Y")  # ✅ tu formato
-        st["last_success_run_key"] = run_key  # ✅ evita repetir este slot
-        # limpia pending
+        st["last_success_date"] = finished.strftime("%d-%m-%Y")
+        st["last_success_run_key"] = run_key
         st.pop("_pending_slot", None)
         st.pop("_pending_run_key", None)
         _write_state(st)
         _append_log(f"=== SUCCESS {st['last_finished_at']} ===")
+        if LOG_TO_STDOUT:
+            print(f"=== SUCCESS {st['last_finished_at']} ===", flush=True)
 
     finally:
         try:
@@ -506,6 +519,7 @@ def status():
             "run_minutes": _parse_run_minutes(),
             "run_window_minutes": RUN_WINDOW_MINUTES,
             "short_only": SHORT_ONLY,
+            "log_to_stdout": LOG_TO_STDOUT,
             "state": state,
             "log_file": str(LOG_FILE),
         }
@@ -523,7 +537,6 @@ def run_daily():
 
     forced = (request.args.get("force") == "1") and ALLOW_FORCE
 
-    # ✅ NUEVO (solo para pruebas): force + slot=short|normal
     forced_profile = (request.args.get("slot") or "").strip().lower()
     if forced_profile not in ("short", "normal"):
         forced_profile = None
@@ -680,6 +693,7 @@ ADMIN_HTML = """
           <div class="pill"><span class="k">profile:</span> {{ state.get('last_profile') }}</div>
           <div class="pill"><span class="k">error_step:</span> {{ state.get('last_error_step') }}</div>
           <div class="pill"><span class="k">short_only:</span> {{ short_only }}</div>
+          <div class="pill"><span class="k">log_to_stdout:</span> {{ log_to_stdout }}</div>
         </div>
         <div style="margin-top:10px">
           <a class="btn" href="/run?token={{ run_token }}&force=1&slot=short" target="_blank">▶️ Probar SHORT</a>
@@ -710,18 +724,20 @@ ADMIN_HTML = """
       {% if uploads %}
         <table>
           <thead>
-            <tr><th>Fecha</th><th>Tipo</th><th>ID</th><th>Links</th></tr>
+            <tr><th>Fecha</th><th>Evento</th><th>Tipo</th><th>ID</th><th>Detalle</th><th>Links</th></tr>
           </thead>
           <tbody>
             {% for u in uploads %}
             <tr>
               <td>{{ u.get('ts') }}</td>
+              <td>{{ u.get('event') }}</td>
               <td>{{ u.get('kind') }}</td>
-              <td>{{ u.get('id') }}</td>
+              <td>{{ u.get('id','') }}</td>
+              <td>{{ u.get('reason','') }}</td>
               <td>
-                <a href="{{ u.get('url_watch') }}" target="_blank">watch</a>
-                &nbsp;|&nbsp;
-                <a href="{{ u.get('url_shorts') }}" target="_blank">shorts</a>
+                {% if u.get('url_watch') %}<a href="{{ u.get('url_watch') }}" target="_blank">watch</a>{% endif %}
+                {% if u.get('url_watch') and u.get('url_shorts') %}&nbsp;|&nbsp;{% endif %}
+                {% if u.get('url_shorts') %}<a href="{{ u.get('url_shorts') }}" target="_blank">shorts</a>{% endif %}
               </td>
             </tr>
             {% endfor %}
@@ -757,6 +773,7 @@ def admin():
         run_token=run_token,
         latest=latest,
         short_only=SHORT_ONLY,
+        log_to_stdout=LOG_TO_STDOUT,
     )
 
 

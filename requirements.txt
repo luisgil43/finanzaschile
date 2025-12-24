@@ -1,3 +1,8 @@
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.2
+aiosignal==1.4.0
+async-timeout==5.0.1
+attrs==25.4.0
 beautifulsoup4==4.14.2
 blinker==1.9.0
 cachetools==5.5.2
@@ -6,8 +11,10 @@ cffi==2.0.0
 charset-normalizer==3.4.4
 click==8.1.8
 curl_cffi==0.13.0
+edge-tts==6.1.12
 Flask==3.0.3
 frozendict==2.4.6
+frozenlist==1.8.0
 google-api-core==2.16.2
 google-api-python-client==2.141.0
 google-auth==2.33.0
@@ -23,6 +30,7 @@ itsdangerous==2.2.0
 Jinja2==3.1.6
 lxml==6.0.2
 MarkupSafe==3.0.3
+multidict==6.7.0
 multitasking==0.0.12
 numpy==2.0.2
 oauthlib==3.3.1
@@ -31,6 +39,7 @@ pandas==2.3.3
 peewee==3.18.2
 pillow==10.4.0
 platformdirs==4.4.0
+propcache==0.4.1
 proto-plus==1.26.1
 protobuf==4.25.8
 pyasn1==0.6.1
@@ -51,6 +60,6 @@ urllib3==1.26.20
 webencodings==0.5.1
 websockets==15.0.1
 Werkzeug==3.1.4
+yarl==1.22.0
 yfinance==0.2.43
 zipp==3.23.0
-edge-tts==6.1.12

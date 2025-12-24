@@ -2,15 +2,15 @@
   "dolar_clp": 908.4,
   "uf_clp": 39697.26,
   "utm_clp": 69542.0,
-  "btc_usd": 87259.0,
-  "eth_usd": 2954.84,
-  "brent_usd": 62.58,
-  "cobre_usd_lb": 5.57,
+  "btc_usd": 87014.0,
+  "eth_usd": 2927.23,
+  "brent_usd": 62.52,
+  "cobre_usd_lb": 5.6148,
   "vigencia": "2025-12-15 a 2025-12-19",
   "g93_clp_l": 1250,
   "g95_clp_l": 1295,
   "g97_clp_l": 1315,
   "diesel_clp_l": 991,
-  "fecha": "2025-12-23",
-  "generated_at": "2025-12-23T20:03:32"
+  "fecha": "23-12-2025",
+  "generated_at": "2025-12-23T23:47:19-03:00"
 }
