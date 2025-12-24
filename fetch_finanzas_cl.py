@@ -1,24 +1,43 @@
-#fetch_finanzas_cl.py
-
-
 """
 fetch_finanzas_cl.py
 - Fuentes robustas y SILENCIOSAS para Cobre/Brent:
   Stooq primero, y Yahoo Chart API (requests) como fallback.
 - Mantiene load_last_ok() para fallback cuando hay reinicios.
-- main() imprime salida estilo consola (para debug local).
-
-NOTA:
-- Evitamos yfinance como fallback porque mete prints/logs raros y a veces falla JSON.
+- GUARDA generated_at + fecha (Chile) en latest.json para que el video/título SIEMPRE
+  use la fecha correcta del día en Chile (no la "fecha" de mindicador).
 """
 
 import datetime as dt
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
+
+
+# =========================
+# TZ helpers (Chile)
+# =========================
+def tz_now() -> dt.datetime:
+    tzname = (os.getenv("TZ") or "America/Santiago").strip()
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(tzname))
+    except Exception:
+        return dt.datetime.now()
+
+
+def fecha_ddmmyyyy(d: Optional[dt.datetime] = None) -> str:
+    d = d or tz_now()
+    return d.strftime("%d-%m-%Y")
+
+
+def fecha_ddmmyyyy_slash(d: Optional[dt.datetime] = None) -> str:
+    d = d or tz_now()
+    return d.strftime("%d/%m/%Y")
+
 
 # =========================
 # Paths
@@ -31,7 +50,7 @@ LATEST_JSON = DATA_DIR / "latest.json"
 LAST_OK_JSON = DATA_DIR / "last_ok.json"
 
 ENAP_FILE = SOURCES_DIR / "enap_semana.json"
-COBRE_OFICIAL_FILE = SOURCES_DIR / "cobre_oficial.json"  # opcional si quieres tener uno local
+COBRE_OFICIAL_FILE = SOURCES_DIR / "cobre_oficial.json"  # opcional
 
 # =========================
 # HTTP helpers
@@ -75,10 +94,6 @@ def _safe_json_write(path: Path, data: Dict) -> None:
 # Persistencia "best effort"
 # =========================
 def load_last_ok() -> Dict:
-    """
-    Último set de valores "buenos" (para fallback cuando un fetch falla).
-    OJO: en Render sin disco persistente se puede perder tras restart.
-    """
     return _safe_json_load(LAST_OK_JSON)
 
 
@@ -86,14 +101,14 @@ def save_last_ok(data: Dict) -> None:
     _safe_json_write(LAST_OK_JSON, data)
 
 
+def save_latest(data: Dict) -> None:
+    _safe_json_write(LATEST_JSON, data)
+
+
 # =========================
-# Stooq helpers (liviano)
+# Stooq helpers
 # =========================
 def _stooq_last_close(symbol: str) -> Optional[float]:
-    """
-    Intenta obtener el último CLOSE desde Stooq.
-    Devuelve float o None.
-    """
     urls = [
         f"https://stooq.pl/q/l/?s={symbol}&i=d",
         f"https://stooq.com/q/l/?s={symbol}&i=d",
@@ -132,17 +147,9 @@ def _stooq_last_close(symbol: str) -> Optional[float]:
 
 
 # =========================
-# Yahoo Chart API fallback (SILENCIOSO + liviano)
+# Yahoo Chart API fallback (silencioso)
 # =========================
 def _yahoo_chart_last_close(ticker: str) -> Optional[float]:
-    """
-    Último cierre usando endpoint público:
-      https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=5d&interval=1d
-
-    Ventajas:
-    - No usa yfinance (no prints raros)
-    - Menos dependencia / menos RAM
-    """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     params = {"range": "5d", "interval": "1d"}
 
@@ -153,8 +160,7 @@ def _yahoo_chart_last_close(ticker: str) -> Optional[float]:
 
         j = r.json()
         chart = (j or {}).get("chart") or {}
-        error = chart.get("error")
-        if error:
+        if chart.get("error"):
             return None
 
         results = chart.get("result") or []
@@ -168,7 +174,6 @@ def _yahoo_chart_last_close(ticker: str) -> Optional[float]:
             return None
 
         closes = (quote[0] or {}).get("close") or []
-        # toma último close no-nulo desde el final
         for x in reversed(closes):
             v = _safe_float(x)
             if v is not None:
@@ -180,12 +185,9 @@ def _yahoo_chart_last_close(ticker: str) -> Optional[float]:
 
 
 # =========================
-# Fuentes principales (Chile + mercados)
+# Fuentes principales
 # =========================
 def get_mindicador() -> Dict:
-    """
-    mindicador.cl (UF, dólar, UTM)
-    """
     url = "https://mindicador.cl/api"
     r = _http_get(url, timeout=20)
     r.raise_for_status()
@@ -199,9 +201,6 @@ def get_mindicador() -> Dict:
 
 
 def get_crypto() -> Dict:
-    """
-    Coingecko simple price
-    """
     url = (
         "https://api.coingecko.com/api/v3/simple/price"
         "?ids=bitcoin,ethereum&vs_currencies=usd"
@@ -215,25 +214,17 @@ def get_crypto() -> Dict:
 
 
 def get_enap_local() -> Dict:
-    """
-    Lee sources/enap_semana.json (editable por tu panel).
-    """
     d = _safe_json_load(ENAP_FILE)
-    out = {
-        "vigencia": (d.get("vigencia") or "").strip(),
+    return {
         "g93_clp_l": d.get("g93_clp_l"),
         "g95_clp_l": d.get("g95_clp_l"),
         "g97_clp_l": d.get("g97_clp_l"),
         "diesel_clp_l": d.get("diesel_clp_l"),
+        "vigencia": (d.get("vigencia") or "").strip(),
     }
-    return out
 
 
 def get_cobre_oficial_local() -> Optional[Dict]:
-    """
-    (Opcional) si tienes una fuente oficial/propia cacheada en sources/cobre_oficial.json:
-      {"cobre_usd_lb": 5.57, "source": "...", "ts": "..."}
-    """
     d = _safe_json_load(COBRE_OFICIAL_FILE)
     if not d:
         return None
@@ -244,20 +235,11 @@ def get_cobre_oficial_local() -> Optional[Dict]:
 
 
 def get_cobre_comex() -> Dict:
-    """
-    Cobre COMEX aprox (USD/lb).
-
-    Prioridad:
-      1) Stooq HG.F (a veces viene en centavos/lb -> convertimos)
-      2) Yahoo Chart HG=F (fallback)
-    """
-    # 1) Stooq
     close = _stooq_last_close("hg.f")
     if close is not None:
         cobre = close / 100.0 if close > 50 else close
         return {"cobre_usd_lb": float(cobre)}
 
-    # 2) Yahoo chart fallback (silencioso)
     yf_close = _yahoo_chart_last_close("HG=F")
     if yf_close is not None:
         return {"cobre_usd_lb": float(yf_close)}
@@ -266,19 +248,10 @@ def get_cobre_comex() -> Dict:
 
 
 def get_brent() -> Dict:
-    """
-    Brent (USD/bbl).
-
-    Prioridad:
-      1) Stooq CB.F
-      2) Yahoo Chart BZ=F (fallback)
-    """
-    # 1) Stooq
     close = _stooq_last_close("cb.f")
     if close is not None:
         return {"brent_usd": float(close)}
 
-    # 2) Yahoo chart fallback (silencioso)
     yf_close = _yahoo_chart_last_close("BZ=F")
     if yf_close is not None:
         return {"brent_usd": float(yf_close)}
@@ -287,72 +260,42 @@ def get_brent() -> Dict:
 
 
 # =========================
-# Consola (debug)
+# Main
 # =========================
-def _fmt_clp(x: Optional[float]) -> str:
-    if x is None:
-        return "N/D"
-    return f"$ {x:,.0f}".replace(",", ".")
-
-
-def _fmt_usd(x: Optional[float]) -> str:
-    if x is None:
-        return "N/D"
-    return f"${x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def _fmt_num(x: Optional[float], nd: str = "N/D") -> str:
-    if x is None:
-        return nd
-    return f"{x:.2f}"
-
-
 def main():
-    """
-    Imprime un resumen estilo consola.
-    Nota: el pipeline real usa fetch_to_json.py, render_panel.py, etc.
-    """
-    d = _safe_json_load(LATEST_JSON) if LATEST_JSON.exists() else {}
-    if not d:
-        last = load_last_ok()
-        try:
-            md = get_mindicador()
-        except Exception:
-            md = {}
-        try:
-            cr = get_crypto()
-        except Exception:
-            cr = {}
-        br = get_brent()
-        cb = get_cobre_comex()
-        en = get_enap_local()
-        d = {**last, **md, **cr, **br, **cb, **en}
+    # Fecha/TS OFICIAL del pipeline (Chile)
+    stamp = tz_now()
 
-    today = dt.datetime.now()
-    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    dia = dias[today.weekday()]
+    last_ok = load_last_ok()
 
-    print(f"\nFINANZAS HOY CHILE — {dia} {today.strftime('%d/%m/%Y')}")
-    print("-" * 64)
-    print(f"Dólar (CLP):       {_fmt_clp(_safe_float(d.get('dolar_clp')))}")
-    print(f"UF (CLP):          {_fmt_clp(_safe_float(d.get('uf_clp')))}")
-    print(f"UTM (CLP):         {_fmt_clp(_safe_float(d.get('utm_clp')))}")
-    print(f"Cobre (USD/lb):    {_fmt_num(_safe_float(d.get('cobre_usd_lb')))}")
-    print(f"Brent (USD/bbl):   {_fmt_usd(_safe_float(d.get('brent_usd')))}")
-    print("-" * 64)
-    print("Combustibles (CLP/L) — Precios a público:")
-    print(f"  93:    {_fmt_clp(_safe_float(d.get('g93_clp_l')))}")
-    print(f"  95:    {_fmt_clp(_safe_float(d.get('g95_clp_l')))}")
-    print(f"  97:    {_fmt_clp(_safe_float(d.get('g97_clp_l')))}")
-    print(f"  Diésel:{_fmt_clp(_safe_float(d.get('diesel_clp_l')))}")
-    print("-" * 64)
-    # (mantengo tu formato; si quieres lo dejamos más limpio después)
-    print(f"BTC (USD):         {_fmt_clp(_safe_float(d.get('btc_usd'))).replace('$','$',1)}")
-    print(f"ETH (USD):         {_fmt_clp(_safe_float(d.get('eth_usd'))).replace('$','$',1)}")
-    print("-" * 64)
+    try:
+        md = get_mindicador()
+    except Exception:
+        md = {}
+
+    try:
+        cr = get_crypto()
+    except Exception:
+        cr = {}
+
+    br = get_brent()
+    cb = get_cobre_oficial_local() or get_cobre_comex()
+    en = get_enap_local()
+
+    data = {**last_ok, **md, **cr, **br, **cb, **en}
+
+    # ✅ Campos de fecha correctos (NO dependen de mindicador)
+    data["generated_at"] = stamp.isoformat()
+    data["fecha"] = fecha_ddmmyyyy(stamp)          # DD-MM-YYYY
+    data["fecha_slash"] = fecha_ddmmyyyy_slash(stamp)  # DD/MM/YYYY
+
+    # Guarda latest + last_ok
+    save_latest(data)
+    save_last_ok(data)
+
+    print(f"OK latest.json generado para {data['fecha_slash']} ({data['generated_at']})")
 
 
 if __name__ == "__main__":
-    # baja el ruido de logs globales si alguna lib insiste
     logging.getLogger().setLevel(logging.ERROR)
     main()

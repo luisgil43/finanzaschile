@@ -8,6 +8,7 @@ ENV TZ=America/Santiago
 # System deps
 # ----------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
     ffmpeg \
     espeak-ng \
     bash \
@@ -17,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     libstdc++6 \
     libgomp1 \
+  && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+  && echo "${TZ}" > /etc/timezone \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

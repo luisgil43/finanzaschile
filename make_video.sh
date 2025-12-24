@@ -1,10 +1,12 @@
+#!/usr/bin/env bash
 set -euo pipefail
 
 export LC_ALL=C
 export LANG=C
 
 IMG="out/frame_1080.png"
-VOZ="out/locucion.m4a"
+VOZ_FULL="out/locucion_full.m4a"
+VOZ_SHORT="out/locucion_short.m4a"
 BGM="assets/bg_music.mp3"
 
 OUT="out/finanzas_hoy.mp4"
@@ -27,39 +29,10 @@ if [ ! -f "$IMG" ]; then
   exit 1
 fi
 
-if [ ! -f "$VOZ" ]; then
-  echo "❌ Falta $VOZ"
-  exit 1
-fi
-
-DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$VOZ" | tr -d '\r\n')
-DUR=$(python3 - <<PY
-d=float("$DUR")
-print(f"{d:.3f}")
-PY
-)
-
-SHORT_DUR=$(python3 - <<PY
-d=float("$DUR")
-print(f"{min(d, 59.0):.3f}")
-PY
-)
-
-FADEOUT_START=$(python3 - <<PY
-d=float("$DUR")
-print(max(0.0, d-0.4))
-PY
-)
-
-FADEOUT_START_SHORT=$(python3 - <<PY
-d=float("$SHORT_DUR")
-print(max(0.0, d-0.4))
-PY
-)
-
 mix_audio () {
   local INVIDEO="$1"
-  local OUTVIDEO="$2"
+  local VOZ="$2"
+  local OUTVIDEO="$3"
 
   if [ -f "$BGM" ]; then
     ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
@@ -75,16 +48,39 @@ mix_audio () {
   fi
 }
 
+probe_dur () {
+  local F="$1"
+  ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$F" | tr -d '\r\n'
+}
+
+fmt3 () {
+  python3 - <<PY
+d=float("$1")
+print(f"{d:.3f}")
+PY
+}
+
 if [ "$GENERATE_FULL_VIDEO" = "1" ]; then
-  # Normal (horizontal). En Render normalmente lo saltas con SHORT_ONLY=1.
+  if [ ! -f "$VOZ_FULL" ]; then
+    echo "❌ Falta $VOZ_FULL (locución FULL)"
+    exit 1
+  fi
+
+  DUR_FULL="$(fmt3 "$(probe_dur "$VOZ_FULL")")"
+  FADEOUT_START_FULL=$(python3 - <<PY
+d=float("$DUR_FULL")
+print(max(0.0, d-0.4))
+PY
+)
+
   ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
     -threads "$FFMPEG_THREADS" \
     -loop 1 -framerate $FPS -i "$IMG" \
-    -t "$DUR" \
-    -vf "scale=1920:1080,fade=t=in:st=0:d=0.4,fade=t=out:st=${FADEOUT_START}:d=0.4,format=yuv420p" \
+    -t "$DUR_FULL" \
+    -vf "scale=1920:1080,fade=t=in:st=0:d=0.4,fade=t=out:st=${FADEOUT_START_FULL}:d=0.4,format=yuv420p" \
     -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r $FPS out/video_sin_audio.mp4
 
-  mix_audio "out/video_sin_audio.mp4" "$OUT"
+  mix_audio "out/video_sin_audio.mp4" "$VOZ_FULL" "$OUT"
   rm -f out/video_sin_audio.mp4
   echo "✅ Generado $OUT"
 else
@@ -92,8 +88,25 @@ else
 fi
 
 if [ "$GENERATE_SHORT_VIDEO" = "1" ]; then
+  if [ ! -f "$VOZ_SHORT" ]; then
+    echo "❌ Falta $VOZ_SHORT (locución SHORT)"
+    exit 1
+  fi
+
+  DUR_SHORT="$(fmt3 "$(probe_dur "$VOZ_SHORT")")"
+  SHORT_DUR=$(python3 - <<PY
+d=float("$DUR_SHORT")
+print(f"{min(d, 59.0):.3f}")
+PY
+)
+
+  FADEOUT_START_SHORT=$(python3 - <<PY
+d=float("$SHORT_DUR")
+print(max(0.0, d-0.4))
+PY
+)
+
   if [ "$LIGHT_SHORT" = "1" ]; then
-    # ✅ ULTRA liviano: escala a 1080 de ancho y pad a 1080x1920 (sin blur/overlay)
     ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
       -threads "$FFMPEG_THREADS" \
       -loop 1 -framerate $FPS -i "$IMG" \
@@ -101,7 +114,6 @@ if [ "$GENERATE_SHORT_VIDEO" = "1" ]; then
       -vf "scale=1080:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fade=t=in:st=0:d=0.4,fade=t=out:st=${FADEOUT_START_SHORT}:d=0.4,format=yuv420p" \
       -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r $FPS out/video_sin_audio_short.mp4
   else
-    # “Bonito” pero más RAM: fondo blur a baja resolución (360x640) y overlay al centro
     ffmpeg -hide_banner -loglevel "$FFMPEG_LOGLEVEL" -y \
       -threads "$FFMPEG_THREADS" \
       -loop 1 -framerate $FPS -i "$IMG" \
@@ -115,7 +127,7 @@ if [ "$GENERATE_SHORT_VIDEO" = "1" ]; then
       -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r $FPS out/video_sin_audio_short.mp4
   fi
 
-  mix_audio "out/video_sin_audio_short.mp4" "$OUT_SHORT"
+  mix_audio "out/video_sin_audio_short.mp4" "$VOZ_SHORT" "$OUT_SHORT"
   rm -f out/video_sin_audio_short.mp4
   echo "✅ Generado $OUT_SHORT"
 else

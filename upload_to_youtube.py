@@ -1,28 +1,11 @@
-# upload_to_youtube.py
-
 import base64
 import datetime as dt
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
-
-try:
-    import importlib.metadata as _im
-    _ = _im.packages_distributions
-except Exception:
-    try:
-        import importlib.metadata as _im
-
-        import importlib_metadata as _imb
-        _im.packages_distributions = _imb.packages_distributions  # type: ignore[attr-defined]
-    except Exception:
-        try:
-            import importlib.metadata as _im
-            _im.packages_distributions = lambda: {}  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -35,6 +18,7 @@ from googleapiclient.http import MediaFileUpload
 BASE = Path(__file__).resolve().parent
 CREDENTIALS_FILE = BASE / "credentials.json"
 TOKEN_FILE = BASE / "token.json"
+LATEST_JSON = BASE / "data" / "latest.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -46,6 +30,11 @@ SHORTS_MAX_SECONDS = float(os.getenv("YT_SHORTS_MAX_SECONDS", "60"))
 UPLOAD_NORMAL = os.getenv("UPLOAD_NORMAL", "1") == "1"
 UPLOAD_SHORT = os.getenv("UPLOAD_SHORT", "1") == "1"
 
+DEFAULT_DESCRIPTION = (
+    "Resumen diario de dólar, UF, UTM, combustibles, cobre, Brent y cripto.\n"
+    "— (Finanzas Hoy Chile)."
+)
+
 
 def _env_b64_present(name: str) -> bool:
     v = os.getenv(name, "")
@@ -53,20 +42,36 @@ def _env_b64_present(name: str) -> bool:
 
 
 def _b64_clean(s: str) -> str:
-    """
-    Render a veces deja '%' al final (o espacios). Limpiamos para evitar decode fail.
-    """
     s = (s or "").strip()
     if s.endswith("%"):
         s = s[:-1]
-    s = s.strip()
-    return s
+    return s.strip()
 
 
 def _write_env_b64(name: str, path: Path):
     raw_s = _b64_clean(os.getenv(name, ""))
     raw = base64.b64decode(raw_s.encode("utf-8"))
     path.write_bytes(raw)
+
+
+def _date_slash_from_latest() -> str:
+    """
+    Usa fecha_slash del pipeline si existe. Si solo hay DD-MM-YYYY, la convierte a DD/MM/YYYY.
+    """
+    try:
+        if LATEST_JSON.exists():
+            d = json.loads(LATEST_JSON.read_text(encoding="utf-8"))
+            fs = (d.get("fecha_slash") or "").strip()
+            if fs:
+                return fs
+            f = (d.get("fecha") or "").strip()  # DD-MM-YYYY
+            if f and "-" in f:
+                parts = f.split("-")
+                if len(parts) == 3:
+                    return f"{parts[0]}/{parts[1]}/{parts[2]}"
+    except Exception:
+        pass
+    return dt.datetime.now().strftime("%d/%m/%Y")
 
 
 def get_service():
@@ -91,7 +96,12 @@ def get_service():
             print(f"⚠️ No se pudo leer token.json ({e}), pidiendo login nuevo...")
             creds = None
 
-    headless = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID")) or (os.getenv("HEADLESS") == "1") or (not sys.stdin.isatty())
+    headless = (
+        bool(os.getenv("RENDER"))
+        or bool(os.getenv("RENDER_SERVICE_ID"))
+        or (os.getenv("HEADLESS") == "1")
+        or (not sys.stdin.isatty())
+    )
 
     if not creds or not creds.valid:
         try:
@@ -163,18 +173,13 @@ def _ffprobe_duration_seconds(path: Path) -> Optional[float]:
 
 
 def _http_error_reason(e: HttpError) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Intenta extraer reason + message del payload JSON.
-    """
     try:
-        # e.content suele ser bytes
-        import json as _json
         content = getattr(e, "content", None)
         if not content:
             return None, None
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="ignore")
-        data = _json.loads(content)
+        data = json.loads(content)
         err = (data or {}).get("error") or {}
         errors = err.get("errors") or []
         if errors:
@@ -194,12 +199,17 @@ def main():
     video = BASE / "out" / "finanzas_hoy.mp4"
     short_video = BASE / "out" / "finanzas_hoy_short.mp4"
 
-    date_str = dt.datetime.now().strftime("%d-%m-%Y")
+    date_slash = _date_slash_from_latest()
 
-    title = os.getenv("YT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date}").format(date=date_str)
-    description = os.getenv("YT_DESCRIPTION")
+    # ✅ Defaults EXACTOS como pediste
+    title_template = os.getenv("YT_TITLE_TEMPLATE", "Finanzas Hoy Chile — {date}")
+    short_title_template = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile — {date} #Shorts")
+
+    title = title_template.format(date=date_slash)
+    short_title = short_title_template.format(date=date_slash)
+
+    description = os.getenv("YT_DESCRIPTION", DEFAULT_DESCRIPTION)
     privacy = os.getenv("YT_PRIVACY", "public")
-    short_title = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date} #Shorts").format(date=date_str)
 
     try:
         if UPLOAD_NORMAL:
@@ -221,27 +231,19 @@ def main():
                 elif dur > SHORTS_MAX_SECONDS:
                     print(f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s.")
                 else:
-                    desc_short = description or ""
-                    if "#shorts" not in desc_short.lower():
-                        desc_short = desc_short.rstrip() + "\n\n#Shorts"
-
-                    vid_s = upload_video(youtube, short_video, title=short_title, description=desc_short, privacy=privacy)
+                    vid_s = upload_video(youtube, short_video, title=short_title, description=description, privacy=privacy)
                     print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
                     if vid_s:
                         print(f"UPLOAD_RESULT kind=short id={vid_s} privacy={privacy}")
 
     except HttpError as e:
         reason, msg = _http_error_reason(e)
-
-        # ✅ Caso que te está pegando:
         if reason == "uploadLimitExceeded":
             print("⚠️ YouTube bloqueó la subida por límite temporal del canal/cuenta (uploadLimitExceeded).")
             if msg:
                 print(f"ℹ️ Detalle: {msg}")
             print("UPLOAD_SKIPPED kind=short reason=uploadLimitExceeded")
-            # Importante: salimos 0 para que el pipeline NO marque failed (pero queda log claro)
             return
-
         print(f"❌ Error YouTube API: {e}")
         raise
 

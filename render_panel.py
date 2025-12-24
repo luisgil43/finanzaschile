@@ -1,9 +1,10 @@
 import datetime as dt
 import json
+import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
-import yfinance as yf
 from PIL import Image, ImageDraw, ImageFont
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -59,8 +60,44 @@ def tw(draw, txt, font):
     try:
         return draw.textbbox((0, 0), txt, font=font)[2]
     except Exception:
-        # Fallback estimado si textbbox falla
-        return int(len(txt) * (font.size * 0.6))
+        return int(len(txt) * (getattr(font, "size", 20) * 0.6))
+
+
+def _dt_from_latest(data: dict) -> dt.datetime:
+    """
+    Usa generated_at/fecha desde latest.json para que la fecha del panel
+    siempre coincida con el día real del pipeline (y no con UTC).
+    """
+    tzname = (os.getenv("TZ") or "America/Santiago").strip() or "America/Santiago"
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = None
+
+    gen = (data or {}).get("generated_at")
+    if isinstance(gen, str) and gen.strip():
+        try:
+            d = dt.datetime.fromisoformat(gen.strip())
+            if d.tzinfo is None and tz:
+                d = d.replace(tzinfo=tz)
+            elif d.tzinfo is not None and tz:
+                d = d.astimezone(tz)
+            return d
+        except Exception:
+            pass
+
+    f = (data or {}).get("fecha")
+    if isinstance(f, str) and f.strip():
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                d = dt.datetime.strptime(f.strip(), fmt)
+                if tz:
+                    d = d.replace(tzinfo=tz)
+                return d
+            except Exception:
+                continue
+
+    return dt.datetime.now(tz) if tz else dt.datetime.now()
 
 
 # -------- Histórico USD/CLP (7 días) ----------
@@ -78,7 +115,6 @@ def _mindicador_series():
         if not serie:
             return []
         puntos = []
-        # Tomamos los últimos 7 y luego invertimos para cronológico
         for it in list(serie)[:7][::-1]:
             f = (it.get("fecha") or "")[:10]
             try:
@@ -94,6 +130,12 @@ def _mindicador_series():
 
 
 def _yahoo_series(ticker: str):
+    # Import “perezoso” para bajar peso/errores en Render
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return []
+
     try:
         df = yf.download(
             ticker, period="12d", interval="1d", progress=False, auto_adjust=True
@@ -144,7 +186,6 @@ def draw_sparkline(draw, rect, points, fonts):
     font_lab, font_val = fonts
 
     if not points or len(points) < 2:
-        # Tarjeta vacía con mensaje
         try:
             draw.rounded_rectangle([x1, y1, x2, y2], radius=18, fill="#08346F")
         except Exception:
@@ -166,7 +207,6 @@ def draw_sparkline(draw, rect, points, fonts):
     except Exception:
         draw.rectangle([x1, y1, x2, y2], fill="#08346F")
 
-    # base line
     try:
         draw.line((gx1, gy2, gx2, gy2), fill="#3E68A6", width=1)
     except Exception:
@@ -225,15 +265,16 @@ def render(data: dict, outpath: Path):
     f_sub = load_font(False, 44)
     f_lab = load_font(False, 44)
     f_val = load_font(True, 58)
-    f_sm = load_font(False, 30)
     f_wm = load_font(True, 34)
 
     title = "FINANZAS HOY CHILE"
     d.text(((W - tw(d, title, f_title)) // 2, 56), title, font=f_title, fill="white")
-    sub = fecha_es()
+
+    # ✅ Fecha desde latest.json (generated_at/fecha) con TZ
+    sub = fecha_es(_dt_from_latest(data))
     d.text(((W - tw(d, sub, f_sub)) // 2, 56 + 92), sub, font=f_sub, fill="#D0E4FF")
 
-    px1, py1, px2, py2 = 160, 230, W - 160, 800  # alto extra
+    px1, py1, px2, py2 = 160, 230, W - 160, 800
     try:
         d.rounded_rectangle(
             [px1, py1, px2, py2], radius=26, fill="#0E2C5A", outline="#5CA9FF"
@@ -253,22 +294,12 @@ def render(data: dict, outpath: Path):
         d.text((x, y), label, font=f_lab, fill="#CFE6FF")
         d.text((x + tw(d, label, f_lab) + 18, y - 10), value, font=f_val, fill="white")
 
-    # Izquierda (tolerante a claves faltantes)
+    # Izquierda
     row("Dólar (CLP):", fmt_clp(data.get("dolar_clp")), c1x, row_y)
     row("UF:", fmt_clp(data.get("uf_clp")), c1x, row_y + step)
     row("UTM:", fmt_clp(data.get("utm_clp")), c1x, row_y + 2 * step)
-    row(
-        "Cobre (USD/lb):",
-        fmt_float(data.get("cobre_usd_lb"), 2),
-        c1x,
-        row_y + 3 * step,
-    )
-    row(
-        "Brent (USD/bbl):",
-        fmt_usd(data.get("brent_usd"), 0),
-        c1x,
-        row_y + 4 * step,
-    )
+    row("Cobre (USD/lb):", fmt_float(data.get("cobre_usd_lb"), 2), c1x, row_y + 3 * step)
+    row("Brent (USD/bbl):", fmt_usd(data.get("brent_usd"), 0), c1x, row_y + 4 * step)
     row("Bitcoin (USD):", fmt_usd(data.get("btc_usd"), 0), c1x, row_y + 5 * step)
     row("Ethereum (USD):", fmt_usd(data.get("eth_usd"), 0), c1x, row_y + 6 * step)
 
@@ -278,9 +309,7 @@ def render(data: dict, outpath: Path):
     bx1, by1 = c2x, row_y
     bx2, by2 = bx1 + box_w, by1 + box_h
     try:
-        d.rounded_rectangle(
-            [bx1, by1, bx2, by2], radius=20, fill="#0B2B57", outline="#78B0FF"
-        )
+        d.rounded_rectangle([bx1, by1, bx2, by2], radius=20, fill="#0B2B57", outline="#78B0FF")
     except Exception:
         d.rectangle([bx1, by1, bx2, by2], fill="#0B2B57", outline="#78B0FF")
 
@@ -293,12 +322,8 @@ def render(data: dict, outpath: Path):
     row("Gasolina 97:", fmt_clp(data.get("g97_clp_l")) + "/L", bx1 + 24, ry)
     ry += step
     row("Diésel:", fmt_clp(data.get("diesel_clp_l")) + "/L", bx1 + 24, ry)
-    ry += step
 
-    # ✅ Cambio pedido: NO mostrar vigencia/fecha de combustibles
-    # (aunque exista en un latest.json antiguo, la ignoramos)
-
-    # Sparkline USD/CLP (ultra-defensivo)
+    # Sparkline USD/CLP
     SPARK_H = 240
     ny1 = py2 + 24
     ny2 = min(ny1 + SPARK_H, H - 24)
@@ -306,11 +331,7 @@ def render(data: dict, outpath: Path):
         ny1 = max(py1 - 16, ny2 - 160)
 
     try:
-        puntos = []
-        try:
-            puntos = get_usdclp_last_7()
-        except Exception:
-            puntos = []
+        puntos = get_usdclp_last_7()
         draw_sparkline(
             d,
             (px1, ny1, px2, ny2),
@@ -318,7 +339,6 @@ def render(data: dict, outpath: Path):
             (load_font(False, 26), load_font(True, 30)),
         )
     except Exception:
-        # Si algo raro pasa en la gráfica, dibujar tarjeta vacía silenciosamente
         try:
             d.rounded_rectangle([px1, ny1, px2, ny2], radius=18, fill="#08346F")
         except Exception:

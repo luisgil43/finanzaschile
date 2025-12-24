@@ -11,6 +11,11 @@ Orden de motores:
 ENDURECIDO:
 - Tolera valores None
 - Si falta cobre/brent/etc. intenta fallback desde "last_ok"
+
+CAMBIO CLAVE:
+- Genera 2 audios distintos:
+  - out/locucion_full.m4a  (video normal, incluye combustibles)
+  - out/locucion_short.m4a (short, guion corto)
 """
 
 import json
@@ -25,7 +30,12 @@ from typing import Dict, Optional
 # ===== Paths =====
 LATEST_JSON = Path(os.getenv("LATEST_JSON_PATH", "data/latest.json"))
 LAST_OK_JSON = Path(os.getenv("LAST_OK_JSON_PATH", "data/last_ok.json"))
-OUT_M4A = Path(os.getenv("VOICE_OUT_PATH", "out/locucion.m4a"))
+
+OUT_FULL_M4A = Path(os.getenv("VOICE_OUT_FULL_PATH", "out/locucion_full.m4a"))
+OUT_SHORT_M4A = Path(os.getenv("VOICE_OUT_SHORT_PATH", "out/locucion_short.m4a"))
+
+OUT_FULL_TXT = Path(os.getenv("VOICE_TXT_FULL_PATH", "out/guion_full.txt"))
+OUT_SHORT_TXT = Path(os.getenv("VOICE_TXT_SHORT_PATH", "out/guion_short.txt"))
 
 # ===== rate general =====
 DEFAULT_RATE = int(os.getenv("SPEAK_RATE", "175"))  # 160–190 natural
@@ -97,7 +107,11 @@ def _merge_with_fallback(latest: Dict, last_ok: Dict) -> Dict:
 # Texto: limpieza + números
 # -------------------------
 def _clean_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+    s = (s or "").strip()
+    # respeta saltos de línea simples (mejor para TTS), pero evita basura
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 
 def _to_int_like(x) -> Optional[int]:
@@ -118,27 +132,71 @@ def _to_float(x) -> Optional[float]:
         return None
 
 
-def build_text_from_json(data: dict) -> str:
+def _si(x, nd="no disponible"):
+    return str(x) if x is not None else nd
+
+
+def build_text_full(data: dict) -> str:
+    """
+    Guion completo (video normal): incluye combustibles.
+    """
     dolar = _to_int_like(data.get("dolar_clp"))
     uf = _to_int_like(data.get("uf_clp"))
+    utm = _to_int_like(data.get("utm_clp"))
+
     btc = _to_int_like(data.get("btc_usd"))
     eth = _to_int_like(data.get("eth_usd"))
+
     cobre = _to_float(data.get("cobre_usd_lb"))
     brent = _to_float(data.get("brent_usd"))
 
-    def si(x, nd="no disponible"):
-        return str(x) if x is not None else nd
+    g93 = _to_int_like(data.get("g93_clp_l"))
+    g95 = _to_int_like(data.get("g95_clp_l"))
+    g97 = _to_int_like(data.get("g97_clp_l"))
+    diesel = _to_int_like(data.get("diesel_clp_l"))
+
+    fecha = (data.get("fecha_slash") or "").strip() or (data.get("fecha") or "").strip()
 
     parts = [
         "Finanzas Hoy Chile.",
-        f"Dólar: {si(dolar)} pesos.",
-        f"UF: {si(uf)} pesos.",
-        f"Cobre: {si(None if cobre is None else round(cobre, 2))} dólares por libra.",
-        f"Petróleo Brent: {si(None if brent is None else round(brent, 2))} dólares por barril.",
-        f"Bitcoin: {si(btc)} dólares.",
-        f"Ethereum: {si(eth)} dólares.",
+        f"Resumen del día {fecha}." if fecha else "Resumen del día.",
+        f"Dólar: {_si(dolar)} pesos.",
+        f"UF: {_si(uf)} pesos.",
+        f"UTM: {_si(utm)} pesos.",
+        "Combustibles:",
+        f"Gasolina 93: {_si(g93)} pesos por litro.",
+        f"Gasolina 95: {_si(g95)} pesos por litro.",
+        f"Gasolina 97: {_si(g97)} pesos por litro.",
+        f"Diésel: {_si(diesel)} pesos por litro.",
+        "Mercados:",
+        f"Cobre: {_si(None if cobre is None else round(cobre, 2))} dólares por libra.",
+        f"Petróleo Brent: {_si(None if brent is None else round(brent, 2))} dólares por barril.",
+        "Cripto:",
+        f"Bitcoin: {_si(btc)} dólares.",
+        f"Ethereum: {_si(eth)} dólares.",
+        "— Finanzas Hoy Chile.",
     ]
     return _clean_spaces("\n".join(parts))
+
+
+def build_text_short(data: dict) -> str:
+    """
+    Guion corto (short): NO es necesario combustibles.
+    """
+    dolar = _to_int_like(data.get("dolar_clp"))
+    uf = _to_int_like(data.get("uf_clp"))
+    btc = _to_int_like(data.get("btc_usd"))
+    fecha = (data.get("fecha_slash") or "").strip() or (data.get("fecha") or "").strip()
+
+    parts = [
+        "Finanzas Hoy Chile.",
+        f"{fecha}." if fecha else "",
+        f"Dólar: {_si(dolar)} pesos.",
+        f"UF: {_si(uf)} pesos.",
+        f"Bitcoin: {_si(btc)} dólares.",
+        "— Finanzas Hoy Chile.",
+    ]
+    return _clean_spaces("\n".join([p for p in parts if p]))
 
 
 # -------------------------
@@ -150,7 +208,6 @@ def _edge_rate_str(v: str) -> str:
         return "+0%"
     if v.endswith("%") and (v.startswith("+") or v.startswith("-")):
         return v
-    # si viene "5" => "+5%"
     try:
         n = int(float(v))
         sign = "+" if n >= 0 else ""
@@ -165,7 +222,6 @@ def _edge_pitch_str(v: str) -> str:
         return "+0Hz"
     if v.lower().endswith("hz") and (v.startswith("+") or v.startswith("-")):
         return v
-    # si viene "0" => "+0Hz"
     try:
         n = int(float(v))
         sign = "+" if n >= 0 else ""
@@ -186,8 +242,8 @@ def _edge_tts_to_m4a(text: str, out_m4a: Path) -> None:
     """
     out_m4a.parent.mkdir(parents=True, exist_ok=True)
 
-    mp3 = out_m4a.with_name("locucion_edge.mp3")
-    vtt = out_m4a.with_name("locucion_edge.vtt")
+    mp3 = out_m4a.with_name(out_m4a.stem + "_edge.mp3")
+    vtt = out_m4a.with_name(out_m4a.stem + "_edge.vtt")
 
     rate = _edge_rate_str(EDGE_RATE)
     pitch = _edge_pitch_str(EDGE_PITCH)
@@ -206,13 +262,11 @@ def _edge_tts_to_m4a(text: str, out_m4a: Path) -> None:
 
     subprocess.run(cmd, check=True)
 
-    # convierte mp3 -> m4a aac
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(mp3), "-c:a", "aac", "-b:a", AUDIO_BITRATE, str(out_m4a)],
         check=True,
     )
 
-    # limpia
     mp3.unlink(missing_ok=True)
     vtt.unlink(missing_ok=True)
 
@@ -368,9 +422,17 @@ def main():
     last_ok = _load_last_ok_anyhow()
     data = _merge_with_fallback(latest, last_ok)
 
-    text = build_text_from_json(data)
     Path("out").mkdir(exist_ok=True)
-    speak(text, OUT_M4A)
+
+    # ✅ FULL
+    text_full = build_text_full(data)
+    OUT_FULL_TXT.write_text(text_full, encoding="utf-8")
+    speak(text_full, OUT_FULL_M4A)
+
+    # ✅ SHORT
+    text_short = build_text_short(data)
+    OUT_SHORT_TXT.write_text(text_short, encoding="utf-8")
+    speak(text_short, OUT_SHORT_M4A)
 
 
 if __name__ == "__main__":
