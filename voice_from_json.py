@@ -1,13 +1,12 @@
+# voice_from_json.py
 """
-voice_from_json.py
-
 Genera la locución en M4A desde data/latest.json.
 
-- macOS: usa /usr/bin/say (mejor calidad, voces del sistema como "Paulina")
-- Linux/Render:
-    1) Edge TTS (neural) si USE_EDGE_TTS=1 y edge-tts está disponible
-    2) Piper (neural) si está configurado
-    3) espeak-ng/espeak fallback
+Orden de motores:
+1) (Opcional) Edge TTS (neural) via CLI `edge-tts` si USE_EDGE_TTS=1
+2) macOS: /usr/bin/say
+3) Linux: Piper (neural) si está disponible
+4) fallback: espeak-ng/espeak
 
 ENDURECIDO:
 - Tolera valores None
@@ -28,18 +27,20 @@ LATEST_JSON = Path(os.getenv("LATEST_JSON_PATH", "data/latest.json"))
 LAST_OK_JSON = Path(os.getenv("LAST_OK_JSON_PATH", "data/last_ok.json"))
 OUT_M4A = Path(os.getenv("VOICE_OUT_PATH", "out/locucion.m4a"))
 
-# ===== macOS say =====
+# ===== rate general =====
 DEFAULT_RATE = int(os.getenv("SPEAK_RATE", "175"))  # 160–190 natural
+
+# ===== Edge TTS (neural) =====
+USE_EDGE_TTS = os.getenv("USE_EDGE_TTS", "0").strip() == "1"
+EDGE_TTS_BIN = os.getenv("EDGE_TTS_BIN", "edge-tts").strip() or "edge-tts"
+EDGE_VOICE = os.getenv("EDGE_VOICE", "es-CL-CatalinaNeural").strip()
+EDGE_RATE = os.getenv("EDGE_RATE", "0").strip()   # puede venir "5" o "+5%"
+EDGE_PITCH = os.getenv("EDGE_PITCH", "0").strip() # puede venir "0" o "+0Hz"
+EDGE_VOLUME = os.getenv("EDGE_VOLUME", "").strip()  # opcional: "+0%"
+
+# ===== macOS say =====
 PREFERRED_ES_VOICES = ["Paulina", "Mónica", "Jorge", "Diego", "Juan"]
 FALLBACK_VOICE = os.getenv("VOICE_NAME", "Paulina").strip()
-
-# ===== Edge TTS (Linux/Render) =====
-USE_EDGE_TTS = os.getenv("USE_EDGE_TTS", "1").strip() == "1"
-EDGE_VOICE = os.getenv("EDGE_VOICE", "es-CL-CatalinaNeural").strip()
-EDGE_RATE = os.getenv("EDGE_RATE", "0").strip()  # acepta "5" o "+5%" o "-5%"
-EDGE_PITCH = os.getenv("EDGE_PITCH", "0").strip()  # acepta "0" o "+0Hz"
-EDGE_VOLUME = os.getenv("EDGE_VOLUME", "").strip()  # opcional, ej "+0%"
-EDGE_OUTPUT = os.getenv("EDGE_OUTPUT", "out/locucion_edge.mp3").strip()
 
 # ===== Piper (Linux/Render) =====
 USE_PIPER = os.getenv("USE_PIPER", "1").strip() == "1"
@@ -54,11 +55,10 @@ PIPER_NOISE_SCALE = os.getenv("PIPER_NOISE_SCALE", "").strip()
 PIPER_NOISE_W = os.getenv("PIPER_NOISE_W", "").strip()
 
 # ===== espeak fallback =====
-# Compat: algunos envs tuyos están como SPEAK_* (antes)
-ESPEAK_VOICE = os.getenv("ESPEAK_VOICE", os.getenv("SPEAK_VOICE", "es+f3")).strip()
-ESPEAK_PITCH = os.getenv("ESPEAK_PITCH", os.getenv("SPEAK_PITCH", "55")).strip()
-ESPEAK_AMP = os.getenv("ESPEAK_AMP", os.getenv("SPEAK_AMP", "115")).strip()
-ESPEAK_GAP = os.getenv("ESPEAK_GAP", os.getenv("SPEAK_GAP", "6")).strip()
+ESPEAK_VOICE = os.getenv("ESPEAK_VOICE", "es+f3").strip()
+ESPEAK_PITCH = os.getenv("ESPEAK_PITCH", "55").strip()
+ESPEAK_AMP = os.getenv("ESPEAK_AMP", "115").strip()
+ESPEAK_GAP = os.getenv("ESPEAK_GAP", "6").strip()
 
 # ffmpeg
 AUDIO_BITRATE = os.getenv("VOICE_AAC_BITRATE", "128k").strip()
@@ -142,6 +142,84 @@ def build_text_from_json(data: dict) -> str:
 
 
 # -------------------------
+# Edge TTS helpers
+# -------------------------
+def _edge_rate_str(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return "+0%"
+    if v.endswith("%") and (v.startswith("+") or v.startswith("-")):
+        return v
+    # si viene "5" => "+5%"
+    try:
+        n = int(float(v))
+        sign = "+" if n >= 0 else ""
+        return f"{sign}{n}%"
+    except Exception:
+        return "+0%"
+
+
+def _edge_pitch_str(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return "+0Hz"
+    if v.lower().endswith("hz") and (v.startswith("+") or v.startswith("-")):
+        return v
+    # si viene "0" => "+0Hz"
+    try:
+        n = int(float(v))
+        sign = "+" if n >= 0 else ""
+        return f"{sign}{n}Hz"
+    except Exception:
+        return "+0Hz"
+
+
+def _have_edge_tts() -> bool:
+    if not USE_EDGE_TTS:
+        return False
+    return shutil.which(EDGE_TTS_BIN) is not None
+
+
+def _edge_tts_to_m4a(text: str, out_m4a: Path) -> None:
+    """
+    Usa CLI edge-tts para generar mp3 + vtt y luego convierte a m4a (aac).
+    """
+    out_m4a.parent.mkdir(parents=True, exist_ok=True)
+
+    mp3 = out_m4a.with_name("locucion_edge.mp3")
+    vtt = out_m4a.with_name("locucion_edge.vtt")
+
+    rate = _edge_rate_str(EDGE_RATE)
+    pitch = _edge_pitch_str(EDGE_PITCH)
+
+    cmd = [
+        EDGE_TTS_BIN,
+        "--voice", EDGE_VOICE,
+        "--rate", rate,
+        "--pitch", pitch,
+        "--text", text,
+        "--write-media", str(mp3),
+        "--write-subtitles", str(vtt),
+    ]
+    if EDGE_VOLUME:
+        cmd += ["--volume", EDGE_VOLUME]
+
+    subprocess.run(cmd, check=True)
+
+    # convierte mp3 -> m4a aac
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(mp3), "-c:a", "aac", "-b:a", AUDIO_BITRATE, str(out_m4a)],
+        check=True,
+    )
+
+    # limpia
+    mp3.unlink(missing_ok=True)
+    vtt.unlink(missing_ok=True)
+
+    print(f"TTS_ENGINE=edge_tts voice={EDGE_VOICE} rate={rate} pitch={pitch}")
+
+
+# -------------------------
 # macOS say
 # -------------------------
 def _list_system_voices() -> str:
@@ -170,67 +248,6 @@ def _pick_spanish_voice() -> str:
                 return cand
 
     return candidates[0] if candidates else (FALLBACK_VOICE or "")
-
-
-# -------------------------
-# Edge TTS
-# -------------------------
-def _normalize_edge_percent(v: str) -> str:
-    v = (v or "").strip()
-    if not v:
-        return "+0%"
-    if v.endswith("%"):
-        if v.startswith(("+", "-")):
-            return v
-        return f"+{v}"
-    # si viene "5" o "-5"
-    try:
-        n = int(v)
-        return f"{'+' if n >= 0 else ''}{n}%"
-    except Exception:
-        # si viene raro, usa default
-        return "+0%"
-
-
-def _normalize_edge_pitch(v: str) -> str:
-    v = (v or "").strip()
-    if not v:
-        return "+0Hz"
-    if v.lower().endswith("hz"):
-        if v.startswith(("+", "-")):
-            return v
-        return f"+{v}"
-    try:
-        n = int(v)
-        return f"{'+' if n >= 0 else ''}{n}Hz"
-    except Exception:
-        return "+0Hz"
-
-
-def _have_edge_tts() -> bool:
-    if not USE_EDGE_TTS:
-        return False
-    return shutil.which("edge-tts") is not None
-
-
-def _edge_tts_to_audio(text: str, out_audio: Path) -> None:
-    out_audio.parent.mkdir(parents=True, exist_ok=True)
-
-    rate = _normalize_edge_percent(EDGE_RATE)
-    pitch = _normalize_edge_pitch(EDGE_PITCH)
-
-    cmd = [
-        "edge-tts",
-        "--voice", EDGE_VOICE,
-        "--text", text,
-        "--write-media", str(out_audio),
-        "--rate", rate,
-        "--pitch", pitch,
-    ]
-    if EDGE_VOLUME:
-        cmd += ["--volume", _normalize_edge_percent(EDGE_VOLUME)]
-
-    subprocess.run(cmd, check=True)
 
 
 # -------------------------
@@ -293,12 +310,12 @@ def _espeak_to_wav(text: str, wav_path: Path, rate: int) -> None:
 
 
 # -------------------------
-# Audio -> M4A
+# WAV -> M4A
 # -------------------------
-def _to_m4a(input_audio: Path, out_m4a: Path) -> None:
+def _wav_to_m4a(wav: Path, out_m4a: Path) -> None:
     out_m4a.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(input_audio), "-c:a", "aac", "-b:a", AUDIO_BITRATE, str(out_m4a)],
+        ["ffmpeg", "-y", "-i", str(wav), "-c:a", "aac", "-b:a", AUDIO_BITRATE, str(out_m4a)],
         check=True,
     )
 
@@ -306,7 +323,12 @@ def _to_m4a(input_audio: Path, out_m4a: Path) -> None:
 def speak(text: str, out_m4a: Path, rate: int = DEFAULT_RATE) -> None:
     out_m4a.parent.mkdir(parents=True, exist_ok=True)
 
-    # macOS
+    # 1) Edge TTS (si está)
+    if _have_edge_tts():
+        _edge_tts_to_m4a(text, out_m4a)
+        return
+
+    # 2) macOS say
     if sys.platform == "darwin" and Path("/usr/bin/say").exists():
         voice = _pick_spanish_voice()
         aiff = out_m4a.with_suffix(".aiff")
@@ -319,39 +341,26 @@ def speak(text: str, out_m4a: Path, rate: int = DEFAULT_RATE) -> None:
 
         subprocess.run(["ffmpeg", "-y", "-i", str(aiff), str(out_m4a)], check=True)
         aiff.unlink(missing_ok=True)
-        print(f"TTS_ENGINE=macos_say voice={voice}", flush=True)
+        print(f"TTS_ENGINE=macos_say voice={voice}")
         return
 
-    # Linux/Render
-    # 1) Edge TTS (neural) => evita voz robótica
-    if _have_edge_tts():
-        try:
-            tmp_audio = Path(EDGE_OUTPUT)
-            _edge_tts_to_audio(text, tmp_audio)
-            _to_m4a(tmp_audio, out_m4a)
-            tmp_audio.unlink(missing_ok=True)
-            print(f"TTS_ENGINE=edge_tts voice={EDGE_VOICE} rate={_normalize_edge_percent(EDGE_RATE)} pitch={_normalize_edge_pitch(EDGE_PITCH)}", flush=True)
-            return
-        except Exception as e:
-            print(f"TTS_ENGINE=edge_tts_failed error={e}", flush=True)
-
-    # 2) Piper
+    # 3) Linux: Piper / espeak
     wav = out_m4a.with_suffix(".wav")
+
     if _have_piper():
         try:
             _piper_to_wav(text, wav)
-            _to_m4a(wav, out_m4a)
+            _wav_to_m4a(wav, out_m4a)
             wav.unlink(missing_ok=True)
-            print(f"TTS_ENGINE=piper model={PIPER_MODEL}", flush=True)
+            print(f"TTS_ENGINE=piper model={PIPER_MODEL}")
             return
         except Exception as e:
-            print(f"TTS_ENGINE=piper_failed error={e}", flush=True)
+            print(f"TTS_ENGINE=piper_failed error={e}")
 
-    # 3) espeak fallback
     _espeak_to_wav(text, wav, rate=rate)
-    _to_m4a(wav, out_m4a)
+    _wav_to_m4a(wav, out_m4a)
     wav.unlink(missing_ok=True)
-    print(f"TTS_ENGINE=espeak voice={ESPEAK_VOICE}", flush=True)
+    print(f"TTS_ENGINE=espeak voice={ESPEAK_VOICE}")
 
 
 def main():

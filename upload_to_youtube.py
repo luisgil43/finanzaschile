@@ -1,6 +1,7 @@
+# upload_to_youtube.py
+
 import base64
 import datetime as dt
-import json
 import os
 import subprocess
 import sys
@@ -51,8 +52,20 @@ def _env_b64_present(name: str) -> bool:
     return bool(v and v.strip())
 
 
+def _b64_clean(s: str) -> str:
+    """
+    Render a veces deja '%' al final (o espacios). Limpiamos para evitar decode fail.
+    """
+    s = (s or "").strip()
+    if s.endswith("%"):
+        s = s[:-1]
+    s = s.strip()
+    return s
+
+
 def _write_env_b64(name: str, path: Path):
-    raw = base64.b64decode(os.getenv(name, "").encode("utf-8"))
+    raw_s = _b64_clean(os.getenv(name, ""))
+    raw = base64.b64decode(raw_s.encode("utf-8"))
     path.write_bytes(raw)
 
 
@@ -75,7 +88,7 @@ def get_service():
         try:
             creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
         except Exception as e:
-            print(f"⚠️ No se pudo leer token.json ({e}), pidiendo login nuevo...", flush=True)
+            print(f"⚠️ No se pudo leer token.json ({e}), pidiendo login nuevo...")
             creds = None
 
     headless = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID")) or (os.getenv("HEADLESS") == "1") or (not sys.stdin.isatty())
@@ -83,7 +96,7 @@ def get_service():
     if not creds or not creds.valid:
         try:
             if creds and creds.expired and creds.refresh_token:
-                print("🔄 Intentando refrescar token de YouTube...", flush=True)
+                print("🔄 Intentando refrescar token de YouTube...")
                 creds.refresh(Request())
             else:
                 raise RefreshError("No hay refresh_token, hay que reautenticar.")
@@ -95,12 +108,12 @@ def get_service():
                     "YT_TOKEN_JSON_B64 / YT_CREDENTIALS_JSON_B64."
                 ) from e
 
-            print(f"⚠️ Token inválido/expirado ({e}). Eliminando token.json y pidiendo login de nuevo...", flush=True)
+            print(f"⚠️ Token inválido/expirado ({e}). Eliminando token.json y pidiendo login de nuevo...")
             try:
                 if token_file.exists():
                     token_file.unlink()
             except Exception as rm_err:
-                print(f"⚠️ No se pudo borrar token.json: {rm_err}", flush=True)
+                print(f"⚠️ No se pudo borrar token.json: {rm_err}")
 
             flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
             creds = flow.run_local_server(port=0)
@@ -131,7 +144,7 @@ def upload_video(youtube, video_path: Path, title: str, description: str, privac
     while response is None:
         status, response = req.next_chunk()
         if status:
-            print(f"⏫ Upload {int(status.progress() * 100)}%", flush=True)
+            print(f"⏫ Upload {int(status.progress() * 100)}%")
 
     return response.get("id")
 
@@ -149,39 +162,34 @@ def _ffprobe_duration_seconds(path: Path) -> Optional[float]:
         return None
 
 
-def _extract_http_error_reason(e: HttpError) -> Tuple[Optional[str], Optional[str]]:
+def _http_error_reason(e: HttpError) -> Tuple[Optional[str], Optional[str]]:
     """
-    Intenta extraer (reason, message) desde el JSON de error de YouTube.
+    Intenta extraer reason + message del payload JSON.
     """
     try:
-        raw = getattr(e, "content", None)
-        if raw:
-            if isinstance(raw, (bytes, bytearray)):
-                txt = raw.decode("utf-8", errors="ignore")
-            else:
-                txt = str(raw)
-            data = json.loads(txt)
-            err = data.get("error") or {}
-            message = err.get("message")
-            errors = err.get("errors") or []
-            if errors and isinstance(errors, list):
-                reason = errors[0].get("reason")
-                msg2 = errors[0].get("message")
-                return reason, (msg2 or message)
-            return None, message
+        # e.content suele ser bytes
+        import json as _json
+        content = getattr(e, "content", None)
+        if not content:
+            return None, None
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="ignore")
+        data = _json.loads(content)
+        err = (data or {}).get("error") or {}
+        errors = err.get("errors") or []
+        if errors:
+            r = errors[0].get("reason")
+            m = errors[0].get("message")
+            return r, m
+        return None, err.get("message")
     except Exception:
-        pass
-
-    s = str(e)
-    if "uploadLimitExceeded" in s:
-        return "uploadLimitExceeded", None
-    return None, None
+        return None, None
 
 
 def main():
     youtube = get_service()
     ch_id, ch_title = whoami(youtube)
-    print(f"👤 Canal autenticado: {ch_title} ({ch_id})", flush=True)
+    print(f"👤 Canal autenticado: {ch_title} ({ch_id})")
 
     video = BASE / "out" / "finanzas_hoy.mp4"
     short_video = BASE / "out" / "finanzas_hoy_short.mp4"
@@ -189,56 +197,52 @@ def main():
     date_str = dt.datetime.now().strftime("%d-%m-%Y")
 
     title = os.getenv("YT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date}").format(date=date_str)
-    description = os.getenv("YT_DESCRIPTION") or ""
+    description = os.getenv("YT_DESCRIPTION")
     privacy = os.getenv("YT_PRIVACY", "public")
     short_title = os.getenv("YT_SHORT_TITLE_TEMPLATE", "Finanzas Hoy Chile - {date} #Shorts").format(date=date_str)
 
     try:
         if UPLOAD_NORMAL:
             if not video.exists():
-                print(f"❌ No existe el video normal: {video}", flush=True)
+                print(f"❌ No existe el video normal: {video}")
             else:
                 vid = upload_video(youtube, video, title=title, description=description, privacy=privacy)
-                print(f"✅ Video subido. ID: {vid} | privacidad: {privacy}", flush=True)
+                print(f"✅ Video subido. ID: {vid} | privacidad: {privacy}")
                 if vid:
-                    print(f"UPLOAD_RESULT kind=normal id={vid} privacy={privacy}", flush=True)
+                    print(f"UPLOAD_RESULT kind=normal id={vid} privacy={privacy}")
 
         if UPLOAD_SHORT:
             if not short_video.exists():
-                print(f"❌ No existe el short: {short_video}", flush=True)
+                print(f"❌ No existe el short: {short_video}")
             else:
                 dur = _ffprobe_duration_seconds(short_video)
                 if dur is None:
-                    print("⚠️ No pude leer duración del short con ffprobe. No lo subo por seguridad.", flush=True)
+                    print("⚠️ No pude leer duración del short con ffprobe. No lo subo por seguridad.")
                 elif dur > SHORTS_MAX_SECONDS:
-                    print(f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s.", flush=True)
-                    print(f"UPLOAD_SKIPPED kind=short reason=too_long duration={dur:.1f}s max={SHORTS_MAX_SECONDS:.0f}s", flush=True)
+                    print(f"⚠️ Short NO subido: dura {dur:.1f}s y el máximo es {SHORTS_MAX_SECONDS:.0f}s.")
                 else:
                     desc_short = description or ""
                     if "#shorts" not in desc_short.lower():
                         desc_short = desc_short.rstrip() + "\n\n#Shorts"
 
                     vid_s = upload_video(youtube, short_video, title=short_title, description=desc_short, privacy=privacy)
-                    print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}", flush=True)
+                    print(f"✅ Short subido. ID: {vid_s} | privacidad: {privacy}")
                     if vid_s:
-                        print(f"UPLOAD_RESULT kind=short id={vid_s} privacy={privacy}", flush=True)
+                        print(f"UPLOAD_RESULT kind=short id={vid_s} privacy={privacy}")
 
     except HttpError as e:
-        reason, msg = _extract_http_error_reason(e)
+        reason, msg = _http_error_reason(e)
 
-        # ✅ caso clave: límite de subidas (externo). No marcamos el pipeline como failed.
+        # ✅ Caso que te está pegando:
         if reason == "uploadLimitExceeded":
-            print("⚠️ YouTube bloqueó la subida por límite temporal del canal/cuenta (uploadLimitExceeded).", flush=True)
+            print("⚠️ YouTube bloqueó la subida por límite temporal del canal/cuenta (uploadLimitExceeded).")
             if msg:
-                print(f"ℹ️ Detalle: {msg}", flush=True)
-            # reportamos como SKIPPED para que server lo guarde en state/uploads
-            if UPLOAD_SHORT:
-                print("UPLOAD_SKIPPED kind=short reason=uploadLimitExceeded", flush=True)
-            if UPLOAD_NORMAL:
-                print("UPLOAD_SKIPPED kind=normal reason=uploadLimitExceeded", flush=True)
-            return  # exit 0
+                print(f"ℹ️ Detalle: {msg}")
+            print("UPLOAD_SKIPPED kind=short reason=uploadLimitExceeded")
+            # Importante: salimos 0 para que el pipeline NO marque failed (pero queda log claro)
+            return
 
-        print(f"❌ Error YouTube API: {e}", flush=True)
+        print(f"❌ Error YouTube API: {e}")
         raise
 
 

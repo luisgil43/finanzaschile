@@ -1,3 +1,5 @@
+# server.py
+
 import datetime as dt
 import fcntl
 import json
@@ -34,10 +36,7 @@ RUN_TOKEN = os.getenv("RUN_TOKEN", "").strip()
 TZ_NAME = os.getenv("TZ", "America/Santiago").strip() or "America/Santiago"
 
 RUN_HOUR = int(os.getenv("RUN_HOUR", "7"))
-
-# ✅ slots dentro de la hora (por defecto 0 y 30)
-RUN_MINUTES = os.getenv("RUN_MINUTES", "0,30").strip()
-
+RUN_MINUTES = os.getenv("RUN_MINUTES", "0,30").strip()  # slots dentro de la hora
 RUN_WINDOW_MINUTES = int(os.getenv("RUN_WINDOW_MINUTES", "10"))
 ALLOW_FORCE = os.getenv("ALLOW_FORCE", "1") == "1"
 
@@ -46,9 +45,10 @@ STATE_FILE = RUNTIME_DIR / "state.json"
 LOCK_FILE = RUNTIME_DIR / "run.lock"
 LOG_FILE = RUNTIME_DIR / "last_run.log"
 
-# Limita crecimiento del log para NO reventar RAM (admin tail)
-MAX_LOG_BYTES = int(os.getenv("MAX_LOG_BYTES", "1000000"))  # 1MB default
-TAIL_BYTES = int(os.getenv("TAIL_BYTES", "250000"))  # 250KB default
+# logs
+MAX_LOG_BYTES = int(os.getenv("MAX_LOG_BYTES", "1000000"))  # 1MB
+TAIL_BYTES = int(os.getenv("TAIL_BYTES", "250000"))  # 250KB
+LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "0") == "1"
 
 BASE_DIR = Path(__file__).resolve().parent
 ENAP_FILE = BASE_DIR / "sources" / "enap_semana.json"
@@ -56,9 +56,6 @@ LATEST_JSON = BASE_DIR / "data" / "latest.json"
 
 IS_RENDER = bool(os.getenv("RENDER")) or bool(os.getenv("RENDER_SERVICE_ID"))
 SHORT_ONLY = os.getenv("SHORT_ONLY", "1" if IS_RENDER else "0") == "1"
-
-# ✅ Nuevo: duplicar el stream del pipeline a logs de Render (stdout)
-LOG_TO_STDOUT = os.getenv("LOG_TO_STDOUT", "1" if IS_RENDER else "0") == "1"
 
 _thread_guard = threading.Lock()
 _background_thread = None
@@ -87,7 +84,7 @@ def login_required(fn):
 
 def _tz_now() -> dt.datetime:
     try:
-        from zoneinfo import ZoneInfo  # py3.9+
+        from zoneinfo import ZoneInfo
         return dt.datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
         return dt.datetime.now()
@@ -117,13 +114,11 @@ def _truncate_log_if_needed() -> None:
         if sz <= MAX_LOG_BYTES:
             return
 
-        # conservamos solo los últimos TAIL_BYTES
         keep = min(TAIL_BYTES, sz)
         with LOG_FILE.open("rb") as f:
             f.seek(-keep, os.SEEK_END)
             chunk = f.read(keep)
 
-        # corta a líneas completas
         text = chunk.decode("utf-8", errors="ignore")
         lines = text.splitlines()
         out = "\n".join(lines[-2000:]) + "\n"
@@ -136,28 +131,33 @@ def _truncate_log_if_needed() -> None:
 
 
 def _append_log(line: str) -> None:
+    """
+    Guarda en archivo y (opcional) también imprime a stdout para Render logs.
+    Esto NO debería reventar RAM: solo streaming.
+    """
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    s = (line or "").rstrip()
+    if not s:
+        return
     with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(line.rstrip() + "\n")
+        f.write(s + "\n")
     _truncate_log_if_needed()
+
+    if LOG_TO_STDOUT:
+        print(s, flush=True)
 
 
 def _tail_log(n_lines: int = 250) -> str:
-    """
-    Lee solo el final del archivo (bytes), evita cargar el log completo a RAM.
-    """
     try:
         if not LOG_FILE.exists():
             return ""
         sz = LOG_FILE.stat().st_size
         if sz <= 0:
             return ""
-
         read_bytes = min(TAIL_BYTES, sz)
         with LOG_FILE.open("rb") as f:
             f.seek(-read_bytes, os.SEEK_END)
             chunk = f.read(read_bytes)
-
         text = chunk.decode("utf-8", errors="ignore")
         lines = text.splitlines()
         return "\n".join(lines[-n_lines:])
@@ -175,10 +175,6 @@ def _read_latest_json() -> Dict:
 
 
 def _run(cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
-    """
-    Ejecuta cmd y streamea salida línea-a-línea al LOG_FILE.
-    Si LOG_TO_STDOUT=1, duplica también a stdout (Render Logs).
-    """
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
@@ -193,26 +189,20 @@ def _run(cmd: List[str], extra_env: Optional[Dict[str, str]] = None) -> Tuple[in
         env=env,
     )
 
-    upload_lines: List[str] = []
+    capture_lines: List[str] = []
     if p.stdout:
         for line in p.stdout:
             s = (line or "").rstrip()
             if not s:
                 continue
-
             _append_log(s)
 
-            if LOG_TO_STDOUT:
-                # ✅ esto hace que Render muestre el proceso en tiempo real
-                print(s, flush=True)
-
-            if s.startswith("UPLOAD_RESULT "):
-                upload_lines.append(s)
-            if s.startswith("UPLOAD_SKIPPED "):
-                upload_lines.append(s)
+            # capturamos solo marcadores chicos, no todo (memoria segura)
+            if s.startswith("UPLOAD_RESULT ") or s.startswith("UPLOAD_SKIPPED "):
+                capture_lines.append(s)
 
     code = p.wait()
-    return code, "\n".join(upload_lines), ""
+    return code, "\n".join(capture_lines), ""
 
 
 def _acquire_lock_nonblocking():
@@ -227,7 +217,7 @@ def _acquire_lock_nonblocking():
 
 
 # =========================
-# Schedule slots (07:00 / 07:30)
+# Schedule slots
 # =========================
 def _parse_run_minutes() -> List[int]:
     out: List[int] = []
@@ -246,13 +236,8 @@ def _parse_run_minutes() -> List[int]:
 
 
 def _match_slot(now: dt.datetime) -> Optional[int]:
-    """
-    Si now cae dentro de la ventana de algún slot (RUN_MINUTES),
-    devuelve el minuto del slot. Si no, None.
-    """
     if now.hour != RUN_HOUR:
         return None
-
     win = max(1, RUN_WINDOW_MINUTES)
     for m in _parse_run_minutes():
         if m <= now.minute < (m + win):
@@ -268,7 +253,6 @@ def _within_run_window(now: dt.datetime) -> bool:
 
 
 def _slot_profile(slot_minute: int) -> str:
-    # 0 => short, 30 => normal
     if slot_minute == 0:
         return "short"
     if slot_minute == 30:
@@ -277,10 +261,6 @@ def _slot_profile(slot_minute: int) -> str:
 
 
 def _should_run(now: dt.datetime, state: Dict) -> Tuple[bool, str]:
-    """
-    Evita doble corrida del mismo slot.
-    Guarda y usa un run_key: YYYY-MM-DD@07:00 o YYYY-MM-DD@07:30
-    """
     slot = _match_slot(now)
     if slot is None:
         return False, "outside_schedule"
@@ -317,11 +297,11 @@ def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
         if not (line.startswith("UPLOAD_RESULT ") or line.startswith("UPLOAD_SKIPPED ")):
             continue
 
-        kind_tag = "UPLOAD_RESULT " if line.startswith("UPLOAD_RESULT ") else "UPLOAD_SKIPPED "
-        payload = line[len(kind_tag):].strip()
-
+        kind = "result" if line.startswith("UPLOAD_RESULT ") else "skipped"
+        payload = line.split(" ", 1)[1].strip() if " " in line else ""
         parts = payload.split()
-        d = {"event": "result" if kind_tag == "UPLOAD_RESULT " else "skipped"}
+
+        d = {"_kind": kind}
         for p in parts:
             if "=" not in p:
                 continue
@@ -332,7 +312,9 @@ def _parse_upload_results(stdout: str, stderr: str) -> List[Dict]:
             vid = d["id"]
             d["url_watch"] = f"https://www.youtube.com/watch?v={vid}"
             d["url_shorts"] = f"https://www.youtube.com/shorts/{vid}"
+
         results.append(d)
+
     return results
 
 
@@ -340,7 +322,6 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
     now = _tz_now()
     state = _read_state()
 
-    # Decide perfil:
     slot = state.get("_pending_slot")
     if forced_profile in ("short", "normal"):
         profile = forced_profile
@@ -364,14 +345,10 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
     _append_log(
         f"\n=== START {state['last_started_at']} by={started_by} forced={forced} profile={profile} run_key={run_key} ==="
     )
-    if LOG_TO_STDOUT:
-        print(f"=== START {state['last_started_at']} by={started_by} forced={forced} profile={profile} run_key={run_key} ===", flush=True)
 
     lock_fp = _acquire_lock_nonblocking()
     if not lock_fp:
         _append_log("LOCK: already running, exiting.")
-        if LOG_TO_STDOUT:
-            print("LOCK: already running, exiting.", flush=True)
         st = _read_state()
         st["last_status"] = "skipped_already_running"
         st["last_finished_at"] = _tz_now().isoformat(timespec="seconds")
@@ -381,8 +358,6 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
     try:
         for name, cmd in _pipeline_steps():
             _append_log(f"[STEP] {name}: {' '.join(cmd)}")
-            if LOG_TO_STDOUT:
-                print(f"[STEP] {name}: {' '.join(cmd)}", flush=True)
 
             extra_env: Dict[str, str] = {}
 
@@ -422,8 +397,6 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
                 st["last_finished_at"] = _tz_now().isoformat(timespec="seconds")
                 _write_state(st)
                 _append_log(f"=== FAIL step={name} code={code} ===")
-                if LOG_TO_STDOUT:
-                    print(f"=== FAIL step={name} code={code} ===", flush=True)
                 return
 
         finished = _tz_now()
@@ -431,13 +404,16 @@ def _run_pipeline_job(started_by: str, forced: bool, forced_profile: Optional[st
         st["last_status"] = "success"
         st["last_finished_at"] = finished.isoformat(timespec="seconds")
         st["last_success_date"] = finished.strftime("%d-%m-%Y")
-        st["last_success_run_key"] = run_key
+
+        # ✅ CLAVE: si fue FORZADO, NO bloquea el cron de las 07:00
+        if started_by == "schedule":
+            st["last_success_run_key"] = run_key
+
+        # limpia pending
         st.pop("_pending_slot", None)
         st.pop("_pending_run_key", None)
         _write_state(st)
         _append_log(f"=== SUCCESS {st['last_finished_at']} ===")
-        if LOG_TO_STDOUT:
-            print(f"=== SUCCESS {st['last_finished_at']} ===", flush=True)
 
     finally:
         try:
@@ -519,7 +495,6 @@ def status():
             "run_minutes": _parse_run_minutes(),
             "run_window_minutes": RUN_WINDOW_MINUTES,
             "short_only": SHORT_ONLY,
-            "log_to_stdout": LOG_TO_STDOUT,
             "state": state,
             "log_file": str(LOG_FILE),
         }
@@ -693,7 +668,6 @@ ADMIN_HTML = """
           <div class="pill"><span class="k">profile:</span> {{ state.get('last_profile') }}</div>
           <div class="pill"><span class="k">error_step:</span> {{ state.get('last_error_step') }}</div>
           <div class="pill"><span class="k">short_only:</span> {{ short_only }}</div>
-          <div class="pill"><span class="k">log_to_stdout:</span> {{ log_to_stdout }}</div>
         </div>
         <div style="margin-top:10px">
           <a class="btn" href="/run?token={{ run_token }}&force=1&slot=short" target="_blank">▶️ Probar SHORT</a>
@@ -710,11 +684,8 @@ ADMIN_HTML = """
             <div class="pill"><span class="k">brent_usd:</span> {{ latest.get('brent_usd') }}</div>
             <div class="pill"><span class="k">generated_at:</span> {{ latest.get('generated_at') }}</div>
           </div>
-          <div class="muted" style="margin-top:8px">
-            Si cobre sale None aquí, el panel va a mostrar N/D (falló el fetch en ese run).
-          </div>
         {% else %}
-          <div class="muted">No existe data/latest.json todavía (aún no corre fetch_to_json en este contenedor).</div>
+          <div class="muted">No existe data/latest.json todavía.</div>
         {% endif %}
       </div>
     </div>
@@ -724,27 +695,31 @@ ADMIN_HTML = """
       {% if uploads %}
         <table>
           <thead>
-            <tr><th>Fecha</th><th>Evento</th><th>Tipo</th><th>ID</th><th>Detalle</th><th>Links</th></tr>
+            <tr><th>Fecha</th><th>Tipo</th><th>ID</th><th>Links</th><th>Estado</th></tr>
           </thead>
           <tbody>
             {% for u in uploads %}
             <tr>
               <td>{{ u.get('ts') }}</td>
-              <td>{{ u.get('event') }}</td>
               <td>{{ u.get('kind') }}</td>
-              <td>{{ u.get('id','') }}</td>
-              <td>{{ u.get('reason','') }}</td>
+              <td>{{ u.get('id') }}</td>
               <td>
                 {% if u.get('url_watch') %}<a href="{{ u.get('url_watch') }}" target="_blank">watch</a>{% endif %}
-                {% if u.get('url_watch') and u.get('url_shorts') %}&nbsp;|&nbsp;{% endif %}
-                {% if u.get('url_shorts') %}<a href="{{ u.get('url_shorts') }}" target="_blank">shorts</a>{% endif %}
+                {% if u.get('url_shorts') %}&nbsp;|&nbsp;<a href="{{ u.get('url_shorts') }}" target="_blank">shorts</a>{% endif %}
+              </td>
+              <td>
+                {% if u.get('_kind') == 'skipped' %}
+                  SKIPPED ({{ u.get('reason') }})
+                {% else %}
+                  OK
+                {% endif %}
               </td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       {% else %}
-        <div class="muted">Aún no hay uploads guardados. (Se llena cuando corre el step upload)</div>
+        <div class="muted">Aún no hay uploads guardados.</div>
       {% endif %}
     </div>
 
@@ -773,7 +748,6 @@ def admin():
         run_token=run_token,
         latest=latest,
         short_only=SHORT_ONLY,
-        log_to_stdout=LOG_TO_STDOUT,
     )
 
 
